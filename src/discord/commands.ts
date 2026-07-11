@@ -72,9 +72,7 @@ async function handleStart(interaction: ChatInputCommandInteraction): Promise<vo
   const guildId = interaction.guildId!;
   await interaction.deferReply();
   await startRelay(guildId, interaction.client);
-  await interaction.editReply(
-    '音声中継を開始しました。(現時点ではDiscord→ChatGPT方向のみ実装済みです。ChatGPT→Discord方向はPhase3で追加予定です)',
-  );
+  await interaction.editReply('音声中継を開始しました(Discord⇔ChatGPT Live 双方向)。');
 }
 
 async function handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -100,7 +98,7 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
     `入力デバイス (GPT_TO_DISCORD_DEVICE): ${status.inputDeviceName ?? config.devices.gptToDiscord ?? '(未設定)'}`,
     `出力デバイス (DISCORD_TO_GPT_DEVICE): ${status.outputDeviceName ?? config.devices.discordToGpt ?? '(未設定)'}`,
     `出力(Discord→GPT, RtAudio/WASAPI): ${status.outboundAudioRunning ? '起動中' : '停止'}`,
-    `入力(GPT→Discord, FFmpeg): ${status.inboundFfmpegRunning ? '起動中' : '停止'}`,
+    `入力(GPT→Discord, RtAudio/WASAPI): ${status.inboundAudioRunning ? '起動中' : '停止'}`,
     `GPT発話状態: ${status.gptSpeaking ? '発話中' : '待機中'}`,
     `Discord入力ゲート: ${status.discordInputGateOpen ? '開放' : '閉鎖/減衰中'}`,
     `エラー状態: ${status.lastError ? `${status.lastError} (${status.lastErrorAt?.toISOString()})` : 'なし'}`,

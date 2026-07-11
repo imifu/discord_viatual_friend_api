@@ -28,21 +28,13 @@ export class DeviceNotFoundError extends AppError {
   }
 }
 
-export class FfmpegNotFoundError extends AppError {
-  constructor(cause?: unknown) {
+export class AudioStreamOpenError extends AppError {
+  constructor(deviceName: string, direction: 'input' | 'output', cause?: unknown) {
     super(
-      'FFmpegが見つかりません。インストールされてPATHが通っているか確認してください。',
-      'FfmpegNotFoundError',
+      `音声デバイスを開始できませんでした(${direction === 'input' ? '入力' : '出力'}): "${deviceName}"。` +
+        '他のアプリで使用中でないか、デバイス名が正しいか確認してください。',
+      `AudioStreamOpenError: direction=${direction} name="${deviceName}"`,
       { cause },
-    );
-  }
-}
-
-export class FfmpegProcessError extends AppError {
-  constructor(context: string, exitCode: number | null, stderrTail?: string) {
-    super(
-      `音声処理(FFmpeg)でエラーが発生しました(${context})。`,
-      `FfmpegProcessError: context=${context} exitCode=${exitCode} stderrTail=${stderrTail ?? ''}`,
     );
   }
 }

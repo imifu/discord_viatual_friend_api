@@ -1,6 +1,6 @@
 import audify from 'audify';
 import { createLogger } from '../utils/logger.js';
-import { DeviceNotFoundError } from '../utils/errors.js';
+import { AudioStreamOpenError, DeviceNotFoundError } from '../utils/errors.js';
 
 const { RtAudio, RtAudioApi, RtAudioFormat } = audify;
 type RtAudio = InstanceType<typeof RtAudio>;
@@ -44,22 +44,26 @@ export function startVirtualOutput(
   const rtAudio = new RtAudio(RtAudioApi.WINDOWS_WASAPI);
   const deviceId = findOutputDeviceId(rtAudio, deviceName);
 
-  rtAudio.openStream(
-    { deviceId, nChannels: channels, firstChannel: 0 },
-    null,
-    RtAudioFormat.RTAUDIO_SINT16,
-    sampleRate,
-    frameSizeSamples,
-    'discord-to-gpt',
-    null,
-    null,
-    NO_STREAM_FLAGS,
-    (type: number, msg: string) => {
-      logger.error(`RtAudio出力エラー(device="${deviceName}", type=${type}): ${msg}`);
-      onError?.(msg);
-    },
-  );
-  rtAudio.start();
+  try {
+    rtAudio.openStream(
+      { deviceId, nChannels: channels, firstChannel: 0 },
+      null,
+      RtAudioFormat.RTAUDIO_SINT16,
+      sampleRate,
+      frameSizeSamples,
+      'discord-to-gpt',
+      null,
+      null,
+      NO_STREAM_FLAGS,
+      (type: number, msg: string) => {
+        logger.error(`RtAudio出力エラー(device="${deviceName}", type=${type}): ${msg}`);
+        onError?.(msg);
+      },
+    );
+    rtAudio.start();
+  } catch (err) {
+    throw new AudioStreamOpenError(deviceName, 'output', err);
+  }
   logger.info(`仮想出力デバイス開始: device="${deviceName}" id=${deviceId}`);
 
   return {

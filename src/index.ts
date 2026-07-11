@@ -8,6 +8,14 @@ import { ConfigError } from './utils/errors.js';
 
 const logger = createLogger('index');
 
+process.on('unhandledRejection', (reason) => {
+  logger.error('未処理のPromise rejectionが発生しました', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('未処理の例外が発生しました', err);
+});
+
 async function main(): Promise<void> {
   let config;
   try {
@@ -45,7 +53,14 @@ async function main(): Promise<void> {
     logger.warn('Discord Gatewayに再接続中です');
   });
 
+  client.on(Events.ShardResume, () => {
+    logger.info('Discord Gatewayへの再接続が完了しました');
+  });
+
+  let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info(`${signal} を受信、終了処理を開始します`);
     const guildIds = [...client.guilds.cache.keys()];
     await Promise.all(guildIds.map((guildId) => leaveChannel(guildId).catch(() => undefined)));

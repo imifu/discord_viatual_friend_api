@@ -1,7 +1,8 @@
-import type { VoiceConnection } from '@discordjs/voice';
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import type { AudioPlayer, VoiceConnection } from '@discordjs/voice';
 import type { PcmMixer } from '../audio/pcm-mixer.js';
 import type { VirtualOutputHandle } from '../audio/virtual-output.js';
+import type { VirtualInputHandle } from '../audio/virtual-input.js';
+import type { VoiceActivityGate } from '../audio/voice-activity.js';
 import type { ReceiverHandle } from '../discord/receiver.js';
 
 /** Live, non-serializable handles for a guild's bridge session. */
@@ -10,12 +11,16 @@ export interface GuildRuntime {
   voiceChannelId?: string;
   /** RtAudio(WASAPI) stream writing Discord audio out to virtual device A. */
   outboundAudio?: VirtualOutputHandle;
-  /** FFmpeg process reading ChatGPT Live audio in from virtual device B (dshow). */
-  inboundFfmpeg?: ChildProcessWithoutNullStreams;
   /** Mixes multiple Discord speakers' PCM into one stream fed to outboundAudio. */
   mixer?: PcmMixer;
   /** Subscribes to Discord speakers and feeds decoded PCM into the mixer. */
   receiverHandle?: ReceiverHandle;
+  /** RtAudio(WASAPI) stream reading ChatGPT Live audio in from virtual device B. */
+  inboundAudio?: VirtualInputHandle;
+  /** Plays inboundAudio's PCM stream into the Discord voice connection. */
+  audioPlayer?: AudioPlayer;
+  /** Tracks ChatGPT Live speaking state (from inboundAudio) to gate outbound Discord audio. */
+  vadGate?: VoiceActivityGate;
 }
 
 /** Displayable status for a guild's bridge session (used by /status). */
@@ -26,7 +31,7 @@ export interface GuildStatus {
   inputDeviceName?: string;
   outputDeviceName?: string;
   outboundAudioRunning: boolean;
-  inboundFfmpegRunning: boolean;
+  inboundAudioRunning: boolean;
   gptSpeaking: boolean;
   discordInputGateOpen: boolean;
   lastError?: string;
@@ -45,7 +50,7 @@ function defaultStatus(): GuildStatus {
     connected: false,
     relayRunning: false,
     outboundAudioRunning: false,
-    inboundFfmpegRunning: false,
+    inboundAudioRunning: false,
     gptSpeaking: false,
     discordInputGateOpen: true,
   };
