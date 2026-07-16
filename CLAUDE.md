@@ -5,8 +5,7 @@
 `CLAUDE_初回PROMPT.md`(BOOTSTRAP)の指示を受けて作成しました。
 
 プロジェクトの機能・構成については [README.md](./README.md) を参照してください。
-レビュー担当(Codex)向けの基準は [AGENTS.md](./AGENTS.md) に策定予定です。
-現時点では作成依頼の初期プロンプトのみで、実質的な基準は未記載です([Issue #2](https://github.com/imifu/discord_viatual_friend_api/issues/2) で追跡)。
+レビュー担当(Codex)向けの基準は [AGENTS.md](./AGENTS.md) を参照してください。
 
 ---
 
@@ -133,7 +132,7 @@
 - **Claude(私)**: 設計・実装・自動テスト整備・リファクタリング・Git操作・PR作成、および
   Codexレビューへの対応を担当する。
 - **Codex**: PRレビュー・品質保証・設計レビュー・セキュリティレビュー・テスト不足の指摘を担当する
-  (詳細は [AGENTS.md](./AGENTS.md)。現時点では未策定、[Issue #2](https://github.com/imifu/discord_viatual_friend_api/issues/2) 参照)。
+  (詳細は [AGENTS.md](./AGENTS.md) を参照)。
 - **Codexのレビューコメントを無条件に採用しない。** 指摘を受けたら、まず技術的に正しいか自分で検証する。
   - 指摘が妥当な場合: 修正し、対応内容をPR上で報告する。
   - 指摘が妥当でない、または意図的な設計判断による場合: 根拠を添えて反論・説明する。単に無視しない。
