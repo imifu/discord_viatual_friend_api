@@ -5,6 +5,7 @@ import { createDiscordClient } from './discord/client.js';
 import { dispatchCommand } from './discord/commands.js';
 import { leaveChannel } from './discord/voice-connection.js';
 import { ConfigError } from './utils/errors.js';
+import { preloadSttModel, type WorkerPurpose } from './audio/stt.js';
 
 const logger = createLogger('index');
 
@@ -33,6 +34,10 @@ async function main(): Promise<void> {
   registerSecret(config.discord.token);
 
   logger.info('Bot起動処理を開始します');
+
+  const preloadPurposes: WorkerPurpose[] = [];
+  if (config.messagePosting.enabled) preloadPurposes.push('scan', 'capture');
+  if (preloadPurposes.length > 0) preloadSttModel(preloadPurposes);
 
   const client = createDiscordClient();
 

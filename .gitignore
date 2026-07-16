@@ -1,6 +1,8 @@
 node_modules/
 dist/
 tmp/
+logs/
+clips/
 .env
 *.log
 npm-debug.log*

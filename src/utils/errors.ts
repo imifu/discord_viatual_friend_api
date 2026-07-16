@@ -63,6 +63,12 @@ export class RelayAlreadyRunningError extends AppError {
   }
 }
 
+export class ClipUnavailableError extends AppError {
+  constructor(reason: string) {
+    super(`クリップを保存できません: ${reason}`);
+  }
+}
+
 export function toUserMessage(error: unknown): string {
   if (error instanceof AppError) return error.userMessage;
   return '予期しないエラーが発生しました。詳細はログを確認してください。';

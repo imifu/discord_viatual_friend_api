@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { ConfigError } from '../utils/errors.js';
+import { DEFAULT_AIR_READING_PROMPT } from './air-reading.js';
 
 function requireString(name: string): string {
   const value = process.env[name];
@@ -40,6 +41,22 @@ function optionalBool(name: string, fallback: boolean): boolean {
   return raw.trim().toLowerCase() === 'true';
 }
 
+function optionalUnitFloat(name: string, fallback: number): number {
+  const value = optionalFloat(name, fallback);
+  if (value < 0 || value > 1) {
+    throw new ConfigError(`環境変数 ${name} は0以上1以下である必要があります (現在値: "${value}")。`);
+  }
+  return value;
+}
+
+function optionalNonNegativeInt(name: string, fallback: number): number {
+  const value = optionalInt(name, fallback);
+  if (value < 0) {
+    throw new ConfigError(`環境変数 ${name} は0以上である必要があります (現在値: "${value}")。`);
+  }
+  return value;
+}
+
 export interface AppConfig {
   discord: {
     token: string;
@@ -64,6 +81,31 @@ export interface AppConfig {
     gptSpeakingHoldMs: number;
     ducking: boolean;
     duckingLevel: number;
+  };
+  messagePosting: {
+    enabled: boolean;
+    channelId?: string;
+    triggerKeywords: string[];
+    replyHoldMs: number;
+  };
+  bargeIn: {
+    enabled: boolean;
+    gptPlaybackLevel: number;
+    voiceThreshold: number;
+    attackMs: number;
+    releaseMs: number;
+  };
+  airReading: {
+    enabled: boolean;
+    prompt: string;
+  };
+  transcriptLog: {
+    enabled: boolean;
+    toFile: boolean;
+    toThread: boolean;
+    threadChannelId?: string;
+    fileDir: string;
+    gptUtteranceHoldMs: number;
   };
 }
 
@@ -96,7 +138,37 @@ export function loadConfig(): AppConfig {
       threshold: optionalFloat('VOICE_ACTIVITY_THRESHOLD', 0.02),
       gptSpeakingHoldMs: optionalInt('GPT_SPEAKING_HOLD_MS', 500),
       ducking: optionalBool('DISCORD_INPUT_DUCKING', true),
-      duckingLevel: optionalFloat('DISCORD_INPUT_DUCKING_LEVEL', 0.1),
+      duckingLevel: optionalUnitFloat('DISCORD_INPUT_DUCKING_LEVEL', 0.1),
+    },
+    bargeIn: {
+      enabled: optionalBool('BARGE_IN_ENABLED', true),
+      gptPlaybackLevel: optionalUnitFloat('BARGE_IN_GPT_PLAYBACK_LEVEL', 0.2),
+      voiceThreshold: optionalUnitFloat('BARGE_IN_VOICE_THRESHOLD', 0.025),
+      attackMs: optionalNonNegativeInt('BARGE_IN_ATTACK_MS', 100),
+      releaseMs: optionalNonNegativeInt('BARGE_IN_RELEASE_MS', 400),
+    },
+    airReading: {
+      enabled: optionalBool('AIR_READING_ENABLED', true),
+      prompt: (optionalString('AIR_READING_PROMPT') ?? DEFAULT_AIR_READING_PROMPT).replace(/\\n/g, '\n'),
+    },
+    messagePosting: {
+      enabled: optionalBool('MESSAGE_POST_ENABLED', false),
+      channelId: optionalString('MESSAGE_POST_CHANNEL_ID'),
+      triggerKeywords: (
+        optionalString('MESSAGE_POST_TRIGGER_KEYWORDS') ?? '投稿して,とうこうして,送信して,そうしんして,送って,おくって'
+      )
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+      replyHoldMs: optionalInt('MESSAGE_POST_REPLY_HOLD_MS', 1500),
+    },
+    transcriptLog: {
+      enabled: optionalBool('TRANSCRIPT_LOG_ENABLED', false),
+      toFile: optionalBool('TRANSCRIPT_LOG_TO_FILE', true),
+      toThread: optionalBool('TRANSCRIPT_LOG_TO_THREAD', false),
+      threadChannelId: optionalString('TRANSCRIPT_LOG_CHANNEL_ID'),
+      fileDir: optionalString('TRANSCRIPT_LOG_DIR') ?? 'logs',
+      gptUtteranceHoldMs: optionalInt('TRANSCRIPT_GPT_UTTERANCE_HOLD_MS', 1500),
     },
   };
 
