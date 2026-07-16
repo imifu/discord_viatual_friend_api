@@ -92,6 +92,8 @@
 ## 6. Pull Request運用
 
 - 作業完了後、次の順で行う: テスト・検証 → コミット → Push → Pull Request作成。**マージはしない。**
+- **PR本文の冒頭には必ず `From Claude` と明記する。** ユーザー・Codexなど他者の発言と混同されないようにするための表記であり、
+  省略しない([Issue #3](https://github.com/imifu/discord_viatual_friend_api/issues/3) 参照)。
 - PR本文には最低限以下を含める。
   - **変更概要**: 何を・なぜ変更したか
   - **設計上の判断**: 既存パターンから外れた選択をした場合はその理由
