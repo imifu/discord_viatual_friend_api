@@ -168,6 +168,14 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
         touchActivity();
         userSpeaking = true;
         refreshBargeInState();
+        // interrupt_response:true cancels the model's in-flight response server-side as soon as
+        // real user speech is detected, but any audio we'd already buffered from that response
+        // (now up to GPT_AUDIO_MAX_BUFFERED_FRAMES worth, since delivery arrives in bursts far
+        // ahead of real-time - see the comment on that constant) is not discarded on its own.
+        // Without this, the cancelled reply's tail would resume playing at full volume once
+        // bargeInActive is lifted. A no-op if nothing is queued.
+        inboundMixer.clearSource('gpt');
+        clipMixer?.clearSource('gpt');
       });
       session.on('userSpeechStopped', () => {
         userSpeaking = false;

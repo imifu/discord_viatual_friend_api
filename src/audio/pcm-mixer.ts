@@ -64,6 +64,16 @@ export class PcmMixer {
     });
   }
 
+  /** Discards whatever is currently queued for a source without removing it (it keeps receiving
+   *  new data). Used to drop a cancelled/interrupted response's still-buffered audio instead of
+   *  letting it play out once ducking or muting is lifted. */
+  clearSource(id: string): void {
+    const queue = this.queues.get(id);
+    if (!queue) return;
+    queue.length = 0;
+    this.queuedBytes.set(id, 0);
+  }
+
   removeSource(id: string): void {
     this.queues.delete(id);
     this.queuedBytes.delete(id);
