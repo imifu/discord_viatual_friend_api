@@ -29,6 +29,8 @@ export interface RealtimeSessionOptions {
   model: string;
   voice: string;
   instructions: string;
+  /** Post-processing playback speed multiplier applied by the API itself (0.25-1.5). */
+  speed: number;
 }
 
 function waitForSocketOpen(ws: OpenAIRealtimeWS): Promise<void> {
@@ -107,6 +109,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
           output: {
             format: { type: 'audio/pcm', rate: REALTIME_SAMPLE_RATE },
             voice: options.voice,
+            speed: options.speed,
           },
         },
       },

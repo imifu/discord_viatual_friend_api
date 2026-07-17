@@ -190,6 +190,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
         model: config.openai.model,
         voice: config.openai.voice,
         instructions: config.airReading.enabled ? config.airReading.prompt : '',
+        speed: config.openai.speed,
       });
       bindRealtimeSession(session, generation);
       return session;
@@ -421,7 +422,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
 
     logger.info(
       `中継開始: guild=${guildId} model=${config.openai.model} voice=${config.openai.voice} ` +
-        `bargeIn=${config.bargeIn.enabled} idleTimeoutMinutes=${config.idleTimeoutMinutes}`,
+        `speed=${config.openai.speed} bargeIn=${config.bargeIn.enabled} idleTimeoutMinutes=${config.idleTimeoutMinutes}`,
     );
   } catch (err) {
     await stopRelay(guildId);
