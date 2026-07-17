@@ -104,9 +104,20 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     let responseStartedAt = 0;
     let rawBytesThisResponse = 0;
     let resampledBytesThisResponse = 0;
+    let deltaCountThisResponse = 0;
+    let minDeltaBytes = Number.POSITIVE_INFINITY;
+    let maxDeltaBytes = 0;
+    let firstDeltaAt = 0;
+    let lastDeltaAt = 0;
 
     function bindRealtimeSession(session: RealtimeSession, generation: number): void {
       session.on('audioDelta', (pcm24kMono) => {
+        const now = Date.now();
+        if (firstDeltaAt === 0) firstDeltaAt = now;
+        lastDeltaAt = now;
+        deltaCountThisResponse += 1;
+        minDeltaBytes = Math.min(minDeltaBytes, pcm24kMono.length);
+        maxDeltaBytes = Math.max(maxDeltaBytes, pcm24kMono.length);
         rawBytesThisResponse += pcm24kMono.length;
         if (gptAudioStream.destroyed) return;
         const resampled = resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels);
@@ -122,15 +133,24 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
           responseStartedAt = Date.now();
           rawBytesThisResponse = 0;
           resampledBytesThisResponse = 0;
+          deltaCountThisResponse = 0;
+          minDeltaBytes = Number.POSITIVE_INFINITY;
+          maxDeltaBytes = 0;
+          firstDeltaAt = 0;
+          lastDeltaAt = 0;
         } else if (responseStartedAt > 0) {
           const wallClockSec = (Date.now() - responseStartedAt) / 1000;
           const rawImpliedSec = rawBytesThisResponse / (REALTIME_SAMPLE_RATE * 2);
           const resampledImpliedSec =
             resampledBytesThisResponse / (config.output.sampleRate * config.output.channels * 2);
+          const deltaSpanSec = firstDeltaAt > 0 ? (lastDeltaAt - firstDeltaAt) / 1000 : 0;
+          const avgDeltaBytes = deltaCountThisResponse > 0 ? Math.round(rawBytesThisResponse / deltaCountThisResponse) : 0;
           logger.info(
             `[診断] 音声バイト数と時間の比較: guild=${guildId} wallClock=${wallClockSec.toFixed(2)}s ` +
               `raw=${rawBytesThisResponse}bytes(${rawImpliedSec.toFixed(2)}s) ` +
-              `resampled=${resampledBytesThisResponse}bytes(${resampledImpliedSec.toFixed(2)}s)`,
+              `resampled=${resampledBytesThisResponse}bytes(${resampledImpliedSec.toFixed(2)}s) ` +
+              `deltaCount=${deltaCountThisResponse} deltaSpan=${deltaSpanSec.toFixed(2)}s ` +
+              `deltaBytes[min=${minDeltaBytes === Number.POSITIVE_INFINITY ? 0 : minDeltaBytes},avg=${avgDeltaBytes},max=${maxDeltaBytes}]`,
           );
         }
       });
