@@ -64,10 +64,6 @@ export interface AppConfig {
     channels: number;
   };
   logLevel: string;
-  vad: {
-    ducking: boolean;
-    duckingLevel: number;
-  };
   bargeIn: {
     enabled: boolean;
     gptPlaybackLevel: number;
@@ -104,10 +100,6 @@ export function loadConfig(): AppConfig {
       channels: optionalInt('OUTPUT_CHANNELS', 2),
     },
     logLevel: optionalString('LOG_LEVEL') ?? 'info',
-    vad: {
-      ducking: optionalBool('DISCORD_INPUT_DUCKING', true),
-      duckingLevel: optionalUnitFloat('DISCORD_INPUT_DUCKING_LEVEL', 0.1),
-    },
     bargeIn: {
       enabled: optionalBool('BARGE_IN_ENABLED', true),
       gptPlaybackLevel: optionalUnitFloat('BARGE_IN_GPT_PLAYBACK_LEVEL', 0.2),

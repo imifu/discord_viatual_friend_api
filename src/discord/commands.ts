@@ -101,7 +101,6 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
     `中継状態: ${status.relayRunning ? '実行中' : '停止中'}`,
     `OpenAI Realtime API: ${status.realtimeConnected ? '接続中' : '未接続'} (model=${config.openai.model}, voice=${config.openai.voice})`,
     `GPT発話状態: ${status.gptSpeaking ? '発話中' : '待機中'}`,
-    `Discord入力ゲート: ${status.discordInputGateOpen ? '開放' : '閉鎖/減衰中'}`,
     `賢い割り込み: ${!config.bargeIn.enabled ? '無効' : status.bargeInActive ? '割り込み中' : '待機中'}`,
     `クリップ用60秒バッファ: ${status.clipBufferRunning ? '記録中' : '停止'}`,
     `空気読みプロンプト: ${config.airReading.enabled ? '有効' : '無効'}`,

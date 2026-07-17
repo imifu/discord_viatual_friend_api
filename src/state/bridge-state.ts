@@ -42,7 +42,6 @@ export interface GuildStatus {
   relayRunning: boolean;
   realtimeConnected: boolean;
   gptSpeaking: boolean;
-  discordInputGateOpen: boolean;
   bargeInActive: boolean;
   clipBufferRunning: boolean;
   lastError?: string;
@@ -62,7 +61,6 @@ function defaultStatus(): GuildStatus {
     relayRunning: false,
     realtimeConnected: false,
     gptSpeaking: false,
-    discordInputGateOpen: true,
     bargeInActive: false,
     clipBufferRunning: false,
   };

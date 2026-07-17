@@ -30,10 +30,15 @@
 - **既存の設計パターンを優先する。** 新しい抽象を導入する前に、同種の問題を既存コードがどう解いているか
   (`src/utils/errors.ts` のエラー階層、`src/config/env.ts` の設定検証、`src/utils/logger.ts` のロギング等)を確認し、
   倣う。パターンが増えるほど「主担当エンジニアが1人で長期間見る」という体制のコストが上がる。
-- **ハウリング対策のゲート制御を壊さない。** Discord→Realtime APIへの送信は必ず`applyDiscordInputGate`
-  (`src/audio/audio-gate.ts`)によるゲート制御を経由させる。モデル発話中かどうか・ユーザーが割り込んだかどうかは
-  独自のRMSしきい値判定ではなく、Realtime API自体のサーバー側VAD(ターン検出)イベントから取得する設計を維持する
-  (`src/realtime/openai-realtime-client.ts`)。ローカルVADへの回帰は提案・実装しない。
+- **Discord→Realtime APIの送信音声をローカルで減衰・ミュートしない。** モデル発話中でもDiscordの実音声を
+  常にそのままRealtime APIへ送る(`src/services/bridge-service.ts`)。送信前に減衰・ミュートすると、
+  割り込み検知の元になる`input_audio_buffer.speech_started`をAPI自身が検知できなくなり、
+  ユーザーが永久に割り込めなくなるデッドロックが起きる(PR #9でCodexが発見・修正した実際の不具合)。
+  モデル発話中かどうか・ユーザーが割り込んだかどうかは、独自のRMSしきい値判定ではなく、
+  Realtime API自体のサーバー側VAD(ターン検出)イベントから取得する設計を維持する
+  (`src/realtime/openai-realtime-client.ts`)。ハウリング対策は、割り込み検知後にモデルの
+  Discord側再生音量を`applyPcmGain`でダッキングする方法(受信側)に限定し、送信側のゲート・
+  ローカルVADへの回帰は提案・実装しない。
 - **信号処理ロジックとI/Oを分離する。** `pcm-mixer` / `audio-gate` / `resampler` のような
   純粋なロジックは、WebSocket接続やDiscordの接続オブジェクトに依存させない。
   I/Oから切り離すことで、後述のユニットテストが書ける状態を維持する。
@@ -151,7 +156,7 @@
 - Pull Requestの自己マージ
 - 秘密情報(Discordトークン、APIキー、`.env`の中身等)をコード・ログ・コミット・PR本文に含めること
 - ユーザーに確認せず要件を変更・拡大すること
-- Discord→Realtime API送信のゲート制御(`applyDiscordInputGate`)を経由しない音声パイプラインへの変更
+- Discord→Realtime API送信の音声をローカルで減衰・ミュートする変更(割り込み検知のデッドロックを再発させるため)
 - 手動テストを実施していないのに実施したと報告すること
 - 破壊的なGit操作(force push、履歴の書き換え等)をユーザーの明示的な合意なく行うこと
 

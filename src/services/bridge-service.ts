@@ -9,7 +9,7 @@ import { ConfigError, NotConnectedError, RelayAlreadyRunningError } from '../uti
 import { PcmMixer } from '../audio/pcm-mixer.js';
 import { resampleFromMono, resampleToMono } from '../audio/resampler.js';
 import { attachReceiver } from '../discord/receiver.js';
-import { applyDiscordInputGate, applyPcmGain } from '../audio/audio-gate.js';
+import { applyPcmGain } from '../audio/audio-gate.js';
 import { PcmRingBuffer } from '../audio/pcm-ring-buffer.js';
 import { MAX_CLIP_SECONDS } from './clip-service.js';
 import { RealtimeSession, REALTIME_SAMPLE_RATE } from '../realtime/openai-realtime-client.js';
@@ -65,10 +65,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       bargeInActive = next;
       logger.info(`賢い割り込み${next ? '開始' : '終了'}: guild=${guildId} gptPlaybackLevel=${config.bargeIn.gptPlaybackLevel}`);
     }
-    updateStatus(guildId, {
-      bargeInActive,
-      discordInputGateOpen: !gptSpeaking || bargeInActive,
-    });
+    updateStatus(guildId, { bargeInActive });
   };
 
   try {
@@ -282,13 +279,14 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       { sampleRate: config.input.sampleRate, channels: config.input.channels, frameMs: FRAME_MS },
       (frame) => {
         clipDiscordStream?.write(frame);
-        const gptSpeaking = runtime.realtimeSession?.isSpeaking() ?? false;
-        const gated = applyDiscordInputGate(frame, gptSpeaking && !bargeInActive, {
-          ducking: config.vad.ducking,
-          duckingLevel: config.vad.duckingLevel,
-        });
+        // Always forward Discord's actual audio to the Realtime API, even while the model is
+        // speaking: the API's own server-side VAD (input_audio_buffer.speech_started) is what
+        // drives bargeInActive below, so attenuating/muting this stream first would prevent the
+        // API from ever seeing a real interruption to detect in the first place. Ducking the
+        // model's own Discord-side playback volume once a barge-in is detected (see
+        // inboundMixer above) is the anti-feedback measure instead.
         runtime.realtimeSession?.appendAudio(
-          resampleToMono(gated, config.input.sampleRate, config.input.channels, REALTIME_SAMPLE_RATE),
+          resampleToMono(frame, config.input.sampleRate, config.input.channels, REALTIME_SAMPLE_RATE),
         );
       },
     );
@@ -305,14 +303,13 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       relayRunning: true,
       realtimeConnected: true,
       gptSpeaking: realtimeSession.isSpeaking(),
-      discordInputGateOpen: !realtimeSession.isSpeaking() || bargeInActive,
       bargeInActive,
       clipBufferRunning: !!clipRingBuffer,
     });
 
     logger.info(
       `中継開始: guild=${guildId} model=${config.openai.model} voice=${config.openai.voice} ` +
-        `ducking=${config.vad.ducking} bargeIn=${config.bargeIn.enabled}`,
+        `bargeIn=${config.bargeIn.enabled}`,
     );
   } catch (err) {
     await stopRelay(guildId);
@@ -364,7 +361,6 @@ export async function stopRelay(guildId: string): Promise<void> {
     relayRunning: false,
     realtimeConnected: false,
     gptSpeaking: false,
-    discordInputGateOpen: true,
     bargeInActive: false,
     clipBufferRunning: false,
   });
