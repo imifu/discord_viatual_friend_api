@@ -27,6 +27,8 @@ export interface GuildRuntime {
   audioPlayer?: AudioPlayer;
   /** Periodic check that restarts Discord-side playback if the AudioPlayer stalls. */
   inboundWatchdog?: NodeJS.Timeout;
+  /** Periodic check that auto-stops the relay after too long with no speech from either side. */
+  idleCheckTimer?: NodeJS.Timeout;
   /** Mixes raw Discord and GPT audio for the rolling clip buffer. */
   clipMixer?: PcmMixer;
   /** Feeds the raw Discord mix into clipMixer. */

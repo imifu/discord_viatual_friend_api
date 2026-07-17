@@ -28,12 +28,15 @@ const REALTIME_RESTART_MAX_DELAY_MS = 30_000;
 const INBOUND_PLAYBACK_STALL_TIMEOUT_MS = 4000;
 const INBOUND_WATCHDOG_INTERVAL_MS = 1000;
 
+const IDLE_CHECK_INTERVAL_MS = 30_000;
+
 /**
- * Starts the audio relay for a guild in both directions: Discord speakers -> mixed -> gated ->
- * resampled -> OpenAI Realtime API, and the Realtime API's spoken response -> resampled -> mixed
- * -> Discord voice connection. The gate implements half-duplex anti-howling: while the model is
- * speaking (per the Realtime API's own turn-detection events), Discord's audio is
- * attenuated/muted before being sent, except during a detected user barge-in.
+ * Starts the audio relay for a guild in both directions: Discord speakers -> mixed -> resampled
+ * -> OpenAI Realtime API (always at full volume, never locally gated, so the API's own
+ * server-side VAD can always detect a real interruption), and the Realtime API's spoken response
+ * -> resampled -> mixed -> Discord voice connection (ducked while a barge-in is detected).
+ * Also auto-stops the relay after `idleTimeoutMinutes` of silence from both sides, since input
+ * audio cost accrues for the whole time the relay is running regardless of who's talking.
  */
 export async function startRelay(guildId: string, client: Client): Promise<void> {
   const status = getStatus(guildId);
@@ -57,6 +60,15 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
 
   let userSpeaking = false;
   let bargeInActive = false;
+
+  // Discord audio streams to the Realtime API continuously for the whole relay session, so
+  // input-audio cost accrues even while nobody is talking (see README/CLAUDE.md). Track the
+  // last time either side actually spoke and auto-stop after too long, so a forgotten /start
+  // doesn't rack up cost indefinitely.
+  let lastActivityAt = Date.now();
+  const touchActivity = (): void => {
+    lastActivityAt = Date.now();
+  };
 
   const refreshBargeInState = (): void => {
     const gptSpeaking = runtime.realtimeSession?.isSpeaking() ?? false;
@@ -82,11 +94,13 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
         gptAudioStream.write(resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels));
       });
       session.on('speakingChanged', (speaking) => {
+        touchActivity();
         updateStatus(guildId, { gptSpeaking: speaking });
         refreshBargeInState();
         logger.info(`GPT発話${speaking ? '開始' : '終了'}: guild=${guildId}`);
       });
       session.on('userSpeechStarted', () => {
+        touchActivity();
         userSpeaking = true;
         refreshBargeInState();
       });
@@ -292,12 +306,30 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     );
 
     runtime.mixer = mixer;
-    runtime.receiverHandle = attachReceiver(connection, botUserId, mixer, config.input.sampleRate, config.input.channels);
+    runtime.receiverHandle = attachReceiver(
+      connection,
+      botUserId,
+      mixer,
+      config.input.sampleRate,
+      config.input.channels,
+      touchActivity,
+    );
     mixer.start();
 
     const resource = createAudioResource(inboundPlaybackStream, { inputType: StreamType.Raw });
     audioPlayer.play(resource);
     hasStartedPlaying = true;
+
+    if (config.idleTimeoutMinutes > 0) {
+      const idleTimeoutMs = config.idleTimeoutMinutes * 60_000;
+      runtime.idleCheckTimer = setInterval(() => {
+        if (Date.now() - lastActivityAt < idleTimeoutMs) return;
+        logger.info(
+          `${config.idleTimeoutMinutes}分間発話がなかったため中継を自動停止します(コスト抑制): guild=${guildId}`,
+        );
+        void stopRelay(guildId);
+      }, IDLE_CHECK_INTERVAL_MS);
+    }
 
     updateStatus(guildId, {
       relayRunning: true,
@@ -309,7 +341,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
 
     logger.info(
       `中継開始: guild=${guildId} model=${config.openai.model} voice=${config.openai.voice} ` +
-        `bargeIn=${config.bargeIn.enabled}`,
+        `bargeIn=${config.bargeIn.enabled} idleTimeoutMinutes=${config.idleTimeoutMinutes}`,
     );
   } catch (err) {
     await stopRelay(guildId);
@@ -324,6 +356,11 @@ export async function stopRelay(guildId: string): Promise<void> {
   if (runtime.inboundWatchdog) {
     clearInterval(runtime.inboundWatchdog);
     runtime.inboundWatchdog = undefined;
+  }
+
+  if (runtime.idleCheckTimer) {
+    clearInterval(runtime.idleCheckTimer);
+    runtime.idleCheckTimer = undefined;
   }
 
   runtime.realtimeRecoveryActive = false;
