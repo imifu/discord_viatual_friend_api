@@ -141,6 +141,15 @@ const handlers: Record<string, Handler> = {
 };
 
 export async function dispatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  // Diagnostic for DiscordAPIError 10062 (Unknown interaction, i.e. we missed Discord's ~3s ack
+  // deadline): logging this the moment we first see the interaction tells us whether it already
+  // arrived late (gateway/network delay upstream of us) or arrived promptly and something in our
+  // own processing before/during deferReply() was slow.
+  const dispatchLatencyMs = Date.now() - interaction.createdTimestamp;
+  if (dispatchLatencyMs > 1000) {
+    logger.warn(`インタラクション受信が遅延しています: command=${interaction.commandName} latency=${dispatchLatencyMs}ms`);
+  }
+
   const handler = handlers[interaction.commandName];
   if (!handler) {
     await interaction.reply({ content: '未実装のコマンドです。', ephemeral: true });
