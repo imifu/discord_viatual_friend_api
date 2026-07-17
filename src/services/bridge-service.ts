@@ -95,16 +95,44 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     let realtimeGeneration = 0;
     let realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
 
+    // Temporary diagnostic for a reported ~4x playback speedup: tally how many raw (24kHz mono)
+    // and resampled (config.output rate/channels) bytes flow through one response, and compare
+    // the duration those byte counts imply against the wall-clock time between speakingChanged
+    // true/false. This tells us whether the byte count itself is already short (OpenAI-side or
+    // our resample producing too little data) versus the byte count being correct but consumed
+    // too fast downstream (mixer/AudioPlayer pacing).
+    let responseStartedAt = 0;
+    let rawBytesThisResponse = 0;
+    let resampledBytesThisResponse = 0;
+
     function bindRealtimeSession(session: RealtimeSession, generation: number): void {
       session.on('audioDelta', (pcm24kMono) => {
+        rawBytesThisResponse += pcm24kMono.length;
         if (gptAudioStream.destroyed) return;
-        gptAudioStream.write(resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels));
+        const resampled = resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels);
+        resampledBytesThisResponse += resampled.length;
+        gptAudioStream.write(resampled);
       });
       session.on('speakingChanged', (speaking) => {
         touchActivity();
         updateStatus(guildId, { gptSpeaking: speaking });
         refreshBargeInState();
         logger.info(`GPT発話${speaking ? '開始' : '終了'}: guild=${guildId}`);
+        if (speaking) {
+          responseStartedAt = Date.now();
+          rawBytesThisResponse = 0;
+          resampledBytesThisResponse = 0;
+        } else if (responseStartedAt > 0) {
+          const wallClockSec = (Date.now() - responseStartedAt) / 1000;
+          const rawImpliedSec = rawBytesThisResponse / (REALTIME_SAMPLE_RATE * 2);
+          const resampledImpliedSec =
+            resampledBytesThisResponse / (config.output.sampleRate * config.output.channels * 2);
+          logger.info(
+            `[診断] 音声バイト数と時間の比較: guild=${guildId} wallClock=${wallClockSec.toFixed(2)}s ` +
+              `raw=${rawBytesThisResponse}bytes(${rawImpliedSec.toFixed(2)}s) ` +
+              `resampled=${resampledBytesThisResponse}bytes(${resampledImpliedSec.toFixed(2)}s)`,
+          );
+        }
       });
       session.on('userSpeechStarted', () => {
         touchActivity();
