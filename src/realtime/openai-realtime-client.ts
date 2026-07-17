@@ -77,7 +77,10 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     const client = new OpenAI({ apiKey: options.apiKey });
     let ws: OpenAIRealtimeWS;
     try {
-      ws = await OpenAIRealtimeWS.create(client, { model: options.model });
+      // Disable permessage-deflate: this connection carries frequent audio-bearing messages,
+      // and the synchronous zlib inflate/deflate work per message adds real main-thread load
+      // for a stream that's already binary/base64 audio and gains little from compression.
+      ws = await OpenAIRealtimeWS.create(client, { model: options.model, options: { perMessageDeflate: false } });
       await waitForSocketOpen(ws);
     } catch (err) {
       throw new OpenAIConnectionError(err);

@@ -5,6 +5,7 @@ import { createDiscordClient } from './discord/client.js';
 import { dispatchCommand } from './discord/commands.js';
 import { leaveChannel } from './discord/voice-connection.js';
 import { ConfigError } from './utils/errors.js';
+import { startEventLoopMonitor } from './utils/event-loop-monitor.js';
 
 const logger = createLogger('index');
 
@@ -34,6 +35,8 @@ async function main(): Promise<void> {
   registerSecret(config.openai.apiKey);
 
   logger.info('Bot起動処理を開始します');
+
+  startEventLoopMonitor();
 
   const client = createDiscordClient();
 
