@@ -20,6 +20,13 @@ const FRAME_MS = 20;
 
 const REALTIME_RESTART_INITIAL_DELAY_MS = 1000;
 const REALTIME_RESTART_MAX_DELAY_MS = 30_000;
+// A session that fails immediately after connecting (e.g. insufficient_quota, an invalid model
+// name) still resolves openRealtimeSession() successfully - the WebSocket itself opened fine,
+// even though the very next server message tears it back down. Only treat a reconnect as
+// genuinely healthy (and reset the backoff) once the session has stayed up this long, otherwise
+// a permanent, immediately-recurring error resets the delay every cycle and the retry loop never
+// backs off - it just hammers the API and the Node event loop every ~1s indefinitely.
+const REALTIME_RESTART_SUCCESS_GRACE_MS = 10_000;
 
 // @discordjs/voice's AudioPlayer can stop draining inboundPlaybackStream on its own side
 // (e.g. AutoPaused after a brief voice-connection hiccup that never fully recovers) - the
@@ -152,8 +159,13 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
           .then((session) => {
             runtime.realtimeSession = session;
             updateStatus(guildId, { realtimeConnected: true });
-            realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
             logger.info(`Realtimeセッションを再接続しました: guild=${guildId}`);
+            const graceTimer = setTimeout(() => {
+              if (runtime.realtimeSession === session) {
+                realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
+              }
+            }, REALTIME_RESTART_SUCCESS_GRACE_MS);
+            session.once('close', () => clearTimeout(graceTimer));
           })
           .catch((err) => {
             logger.error(`Realtimeセッションの再接続に失敗しました: guild=${guildId}`, err);
