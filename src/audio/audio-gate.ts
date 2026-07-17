@@ -1,8 +1,3 @@
-export interface DiscordInputGateOptions {
-  ducking: boolean;
-  duckingLevel: number;
-}
-
 /** Applies a linear gain to signed 16-bit PCM, clamping at the format limits. */
 export function applyPcmGain(frame: Buffer, level: number): Buffer {
   if (level === 1) return frame;
@@ -16,15 +11,4 @@ export function applyPcmGain(frame: Buffer, level: number): Buffer {
     out.writeInt16LE(adjusted, i * 2);
   }
   return out;
-}
-
-/**
- * Applies half-duplex gating to a Discord -> ChatGPT Live PCM frame: when `gated` is true
- * (ChatGPT Live is speaking, or within its release hold), the frame is either attenuated
- * (ducking) or fully silenced, to prevent ChatGPT Live's own voice from being fed back to it.
- */
-export function applyDiscordInputGate(frame: Buffer, gated: boolean, options: DiscordInputGateOptions): Buffer {
-  if (!gated) return frame;
-  if (!options.ducking) return Buffer.alloc(frame.length);
-  return applyPcmGain(frame, options.duckingLevel);
 }

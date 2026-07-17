@@ -11,11 +11,13 @@
 
 ## 1. プロジェクトの性質(方針に影響する前提)
 
-- **Windows専用**の常駐プロセスであり、`audify`(RtAudio/WASAPI)というネイティブ依存を介して
-  実オーディオデバイスを直接掴む。CI上や他OSでは音声パイプラインの実動作を検証できない。
-- **OpenAI API / Realtime APIは一切使用しない**。ChatGPT Liveとの連携は音声デバイス経由のみで、
-  テキストや画像などの自動注入は行わない。この制約を壊すような実装(API直叩き等)は要件からの逸脱なので提案しない。
-- 自動テストが整備されていない領域(Discord実接続・実オーディオデバイス)が多く、
+- **OpenAI Realtime APIを直接使用する。**(`src/realtime/openai-realtime-client.ts`、WebSocket接続)。
+  Discord音声は48kHz/2ch⇔24kHz/monoにリサンプルして送受信する。「OpenAI API/Realtime APIは使用しない」
+  という制約は過去の方針であり、現在は反対に主要な連携経路そのものである(2026年、API版へ移行済み)。
+- 以前は`audify`(RtAudio/WASAPI)経由で仮想オーディオデバイスを直接掴む実装だったが、API版移行により
+  ネイティブオーディオデバイス依存はなくなった。ただし現時点ではWindows以外での動作検証は行っていない
+  (README 16章参照)。
+- 自動テストが整備されていない領域(Discord実接続・OpenAI Realtime API接続)が多く、
   README「手動テスト手順」の表が現時点での正式な受け入れ基準になっている。
 - 秘密情報(`DISCORD_TOKEN`等)は `.env` にのみ存在し、Git管理対象外(`.gitignore`済み)。
 
@@ -28,15 +30,21 @@
 - **既存の設計パターンを優先する。** 新しい抽象を導入する前に、同種の問題を既存コードがどう解いているか
   (`src/utils/errors.ts` のエラー階層、`src/config/env.ts` の設定検証、`src/utils/logger.ts` のロギング等)を確認し、
   倣う。パターンが増えるほど「主担当エンジニアが1人で長期間見る」という体制のコストが上がる。
-- **音声パイプラインの不変条件を壊さない。** Discord→GPT用とGPT→Discord用は必ず独立した仮想デバイスペア
-  (`CABLE-A` / `CABLE-B`)を使う。これを1組にまとめる・共用する変更はハウリングの原因になるため、
-  README/コードのどちらであっても提案・実装しない。
-- **信号処理ロジックとI/Oを分離する。** `pcm-mixer` / `voice-activity` / `audio-gate` のような
-  純粋なロジックは、RtAudioストリームやDiscordの接続オブジェクトに依存させない。
+- **Discord→Realtime APIの送信音声をローカルで減衰・ミュートしない。** モデル発話中でもDiscordの実音声を
+  常にそのままRealtime APIへ送る(`src/services/bridge-service.ts`)。送信前に減衰・ミュートすると、
+  割り込み検知の元になる`input_audio_buffer.speech_started`をAPI自身が検知できなくなり、
+  ユーザーが永久に割り込めなくなるデッドロックが起きる(PR #9でCodexが発見・修正した実際の不具合)。
+  モデル発話中かどうか・ユーザーが割り込んだかどうかは、独自のRMSしきい値判定ではなく、
+  Realtime API自体のサーバー側VAD(ターン検出)イベントから取得する設計を維持する
+  (`src/realtime/openai-realtime-client.ts`)。ハウリング対策は、割り込み検知後にモデルの
+  Discord側再生音量を`applyPcmGain`でダッキングする方法(受信側)に限定し、送信側のゲート・
+  ローカルVADへの回帰は提案・実装しない。
+- **信号処理ロジックとI/Oを分離する。** `pcm-mixer` / `audio-gate` / `resampler` のような
+  純粋なロジックは、WebSocket接続やDiscordの接続オブジェクトに依存させない。
   I/Oから切り離すことで、後述のユニットテストが書ける状態を維持する。
 - **要件を勝手に変更・拡大しない。** 曖昧な指示や、実装中に見つけた「ついでに直したい」対象は、
   無断で着手せず、まずユーザーに確認するか、着手中のタスクとは別のPRとして切り出す。
-- **依存追加は慎重に。** 特にネイティブモジュール(`audify`等)はビルド・配布が壊れやすい。
+- **依存追加は慎重に。** 特にネイティブモジュールはビルド・配布が壊れやすい(過去の`audify`が実例)。
   新規依存を追加する前に、既存依存や標準ライブラリで代替できないか検討する。
 
 ---
@@ -51,7 +59,7 @@
 - **ログは `src/utils/logger.ts` の `createLogger(scope)` 経由で出す。** `console.log` の直接呼び出しは避け、
   秘密情報を記録する可能性がある値は `registerSecret` に登録してリダクション対象にする。
 - **状態はスコープを意識する。** `src/state/bridge-state.ts` はギルド単位で状態を持つ設計になっている。
-  「複数ギルド同時運用は未検証」という既存の制限(README 20章)を変更する場合は、
+  「複数ギルド同時運用は未検証」という既存の制限(README 16章)を変更する場合は、
   状態管理の設計自体を見直す必要があることを認識した上で着手する。
 - **ESM / strict TypeScript を維持する。** `tsconfig.json` の `strict` / `noUncheckedIndexedAccess` を
   緩めない。相対importには `.js` 拡張子を付ける(`moduleResolution: NodeNext` の制約)。
@@ -114,10 +122,10 @@
 
 - **PRを出す前に必ず実行するもの**: `npm run typecheck`、`npm run lint`、`npm run build`。
   すべてエラーなく通ることを確認してからPRを作成する。
-- **実機依存の変更(Discord接続・音声デバイス・VC操作)**: README「手動テスト手順」表の該当項目を
+- **実機依存の変更(Discord接続・OpenAI Realtime API接続・VC操作)**: README「手動テスト手順」表の該当項目を
   実際に手動実施し、PR本文に結果を書く。実行できない環境の場合は「未実施」と正直に書き、
   ユーザーに実機での確認を依頼する。動作確認したと偽らない。
-- **純粋ロジックの変更(mixer/VAD/gate/ring-buffer/env検証/エラーメッセージ組み立て等)**:
+- **純粋ロジックの変更(mixer/gate/resampler/ring-buffer/env検証/エラーメッセージ組み立て等)**:
   ハードウェアに依存しないため、自動テストを書くことを積極的に検討する。現在テストランナーが
   存在しないため、新規依存を避けたい方針(2章)に沿って、まずは Node.js標準の `node:test` +
   `node --import tsx` あたりの軽量な構成を提案し、ユーザーの合意を得た上で導入する。
@@ -148,8 +156,7 @@
 - Pull Requestの自己マージ
 - 秘密情報(Discordトークン、APIキー、`.env`の中身等)をコード・ログ・コミット・PR本文に含めること
 - ユーザーに確認せず要件を変更・拡大すること
-- OpenAI API / Realtime APIなど、README記載の設計方針(音声デバイス経由のみでの連携)に反する実装
-- Discord→GPT用とGPT→Discord用の仮想デバイスペアを共用・統合する変更
+- Discord→Realtime API送信の音声をローカルで減衰・ミュートする変更(割り込み検知のデッドロックを再発させるため)
 - 手動テストを実施していないのに実施したと報告すること
 - 破壊的なGit操作(force push、履歴の書き換え等)をユーザーの明示的な合意なく行うこと
 
