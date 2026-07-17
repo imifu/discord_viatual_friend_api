@@ -44,6 +44,14 @@ function optionalUnitFloat(name: string, fallback: number): number {
   return parsed;
 }
 
+function optionalNonNegativeInt(name: string, fallback: number): number {
+  const value = optionalInt(name, fallback);
+  if (value < 0) {
+    throw new ConfigError(`環境変数 ${name} は0以上である必要があります (現在値: "${value}")。`);
+  }
+  return value;
+}
+
 export interface AppConfig {
   discord: {
     token: string;
@@ -64,6 +72,8 @@ export interface AppConfig {
     channels: number;
   };
   logLevel: string;
+  /** Auto-stop the relay after this many minutes with no Discord speaker and no model speech. 0 disables it. */
+  idleTimeoutMinutes: number;
   bargeIn: {
     enabled: boolean;
     gptPlaybackLevel: number;
@@ -88,7 +98,7 @@ export function loadConfig(): AppConfig {
     },
     openai: {
       apiKey: requireString('OPENAI_API_KEY'),
-      model: optionalString('OPENAI_REALTIME_MODEL') ?? 'gpt-realtime-2.1',
+      model: optionalString('OPENAI_REALTIME_MODEL') ?? 'gpt-realtime-2.1-mini',
       voice: optionalString('OPENAI_VOICE') ?? 'marin',
     },
     input: {
@@ -100,6 +110,7 @@ export function loadConfig(): AppConfig {
       channels: optionalInt('OUTPUT_CHANNELS', 2),
     },
     logLevel: optionalString('LOG_LEVEL') ?? 'info',
+    idleTimeoutMinutes: optionalNonNegativeInt('IDLE_TIMEOUT_MINUTES', 15),
     bargeIn: {
       enabled: optionalBool('BARGE_IN_ENABLED', true),
       gptPlaybackLevel: optionalUnitFloat('BARGE_IN_GPT_PLAYBACK_LEVEL', 0.2),

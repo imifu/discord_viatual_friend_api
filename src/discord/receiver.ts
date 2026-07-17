@@ -22,6 +22,8 @@ export function attachReceiver(
   mixer: PcmMixer,
   sampleRate: number,
   channels: number,
+  /** Invoked on every utterance start (not just the first), for idle-timeout tracking. Not a VAD - just Discord's own native speaking signal. */
+  onUserSpeaking?: (userId: string) => void,
 ): ReceiverHandle {
   const receiver = connection.receiver;
   const active = new Map<string, { opusStream: ReturnType<typeof receiver.subscribe>; decoder: opus.Decoder }>();
@@ -38,6 +40,7 @@ export function attachReceiver(
 
   const onSpeakingStart = (userId: string): void => {
     if (userId === botUserId) return;
+    onUserSpeaking?.(userId);
     if (active.has(userId)) return;
 
     logger.info(`音声受信開始: user=${userId}`);

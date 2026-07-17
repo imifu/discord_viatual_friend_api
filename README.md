@@ -106,7 +106,7 @@ DISCORD_CLIENT_ID=        # 手順4で取得したApplication ID
 DISCORD_GUILD_ID=         # テストに使うサーバーのID(サーバー名を右クリック→IDをコピー。開発者モードを有効にする必要あり)
 
 OPENAI_API_KEY=            # 手順8で取得したOpenAI APIキー
-OPENAI_REALTIME_MODEL=gpt-realtime-2.1
+OPENAI_REALTIME_MODEL=gpt-realtime-2.1-mini
 OPENAI_VOICE=marin
 
 INPUT_SAMPLE_RATE=48000
@@ -116,6 +116,8 @@ OUTPUT_SAMPLE_RATE=48000
 OUTPUT_CHANNELS=2
 
 LOG_LEVEL=info
+
+IDLE_TIMEOUT_MINUTES=15
 
 BARGE_IN_ENABLED=true
 BARGE_IN_GPT_PLAYBACK_LEVEL=0.2
@@ -137,6 +139,23 @@ AIR_READING_ENABLED=true
 ### 賢い割り込み
 
 `BARGE_IN_ENABLED=true` の場合、Realtime APIのサーバー側VADがユーザーの発話開始・終了を検知し、モデルの発話中にユーザーが話し始めると自動的にモデル側の応答を割り込み(truncate)します。Discordからの送信音声はモデル発話中でも常にそのままAPIへ送っており(ローカルで減衰・ミュートすることはありません)、これによりAPI側のVADが確実にユーザーの発話を検知できます。割り込みが検知されている間は、Discord側で再生するモデルの音量を `BARGE_IN_GPT_PLAYBACK_LEVEL`(0〜1)まで下げます。割り込みの検知・解除タイミングそのものはAPI側のVADに委ねているため、以前のバージョンにあった `BARGE_IN_VOICE_THRESHOLD` 等のローカルしきい値調整は不要になりました。
+
+### 無音時の自動停止(コスト対策)
+
+Discordからの音声は `/start` している間、誰も話していなくても常時Realtime APIへ送信され続けます(賢い割り込みの検知をAPI側のVADに委ねているため)。つまり音声入力の課金は「実際に会話した時間」ではなく「`/start`している時間」に比例します。`IDLE_TIMEOUT_MINUTES`(既定15分)を設定すると、Discord参加者・モデルのどちらもその時間発話しなかった場合に中継を自動的に `/stop` します。`/start`をつけっぱなしにして忘れた場合のコストを構造的に抑えられます。`0`にすると無効化されます。
+
+### API使用料金の目安
+
+OpenAI公式の料金ページ([2026年7月時点](https://platform.openai.com/docs/pricing))によると、Realtime APIの音声はモデルごとに以下の単価です(1Mトークンあたり)。
+
+| モデル | 音声入力 | 音声出力 | 音声入力(キャッシュ) |
+|---|---|---|---|
+| `gpt-realtime-2.1` | $32.00 | $64.00 | $0.40 |
+| `gpt-realtime-2.1-mini`(既定) | $10.00 | $20.00 | $0.30 |
+
+音声は「入力100ms=1token(≒600 tokens/分)、出力50ms=1token(≒1,200 tokens/分)」に相当するため、`gpt-realtime-2.1-mini`では概算で**音声入力$0.006/分・音声出力$0.024/分**になります(会話品質は標準モデルより劣る可能性があるため、実際に試してから選んでください)。
+
+`/start`している時間全体に音声入力コストがかかり、モデルが実際に発話している時間だけ音声出力コストがかかります。1時間接続してモデルが30%発話した場合の概算は、`gpt-realtime-2.1-mini`で約$0.79/時間、`gpt-realtime-2.1`で約$2.53/時間です(会話履歴のキャッシュにより実際はこれより安くなることが多いです)。正確な金額は[OpenAIの使用量ダッシュボード](https://platform.openai.com/usage)で確認してください。
 
 ## 10. インストール方法
 
@@ -237,3 +256,4 @@ npm start
 | 21 | 賢い割り込み | AI発話中にDiscordで発話 | `/status`が`賢い割り込み: 割り込み中`になりAI音量が下がる。発話終了後に復帰 |
 | 22 | 直前クリップ | 中継開始後に`/clip seconds:30` | DiscordとAIの直前ミックス音声WAVが添付される |
 | 23 | 空気読みプロンプト | `/airprompt` | Realtimeセッションに自動設定されているプロンプトが本人だけに表示される |
+| 24 | 無音時の自動停止 | `IDLE_TIMEOUT_MINUTES`を短く(例: 1)設定し、`/start`後に誰も話さず待つ | 設定時間経過後、ログに「発話がなかったため中継を自動停止します」が出力され、`/status`で停止状態になる |
