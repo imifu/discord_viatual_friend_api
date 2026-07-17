@@ -115,7 +115,7 @@ export function loadConfig(): AppConfig {
       apiKey: requireString('OPENAI_API_KEY'),
       model: optionalString('OPENAI_REALTIME_MODEL') ?? 'gpt-realtime-2.1-mini',
       voice: optionalString('OPENAI_VOICE') ?? 'marin',
-      speed: optionalRangeFloat('OPENAI_VOICE_SPEED', 0.8, 0.25, 1.5),
+      speed: optionalRangeFloat('OPENAI_VOICE_SPEED', 0.9, 0.25, 1.5),
     },
     input: {
       sampleRate: optionalInt('INPUT_SAMPLE_RATE', 48000),
