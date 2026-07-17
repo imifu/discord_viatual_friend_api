@@ -1,7 +1,7 @@
 {
   "name": "discord-gptlive-bridge",
   "version": "0.1.0",
-  "description": "Discord VC <-> ChatGPT Live (Chrome, manual) audio bridge using virtual audio cables",
+  "description": "Discord VC <-> OpenAI Realtime API audio bridge",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,6 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "register": "tsx src/discord/command-register.ts",
-    "devices": "tsx src/audio/device-list.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint ."
   },
@@ -19,18 +18,19 @@
   },
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
-    "@huggingface/transformers": "^4.2.0",
-    "audify": "^1.10.1",
     "discord.js": "^14.26.5",
     "dotenv": "^17.4.2",
     "libsodium-wrappers": "^0.8.4",
+    "openai": "^6.48.0",
     "opusscript": "^0.0.8",
-    "prism-media": "^1.3.5"
+    "prism-media": "^1.3.5",
+    "ws": "^8.21.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.19.0",
     "@types/libsodium-wrappers": "^0.7.14",
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
     "eslint": "^9.19.0",
     "tsx": "^4.23.0",
     "typescript": "^5.9.3",

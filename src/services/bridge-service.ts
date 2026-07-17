@@ -4,44 +4,36 @@ import type { AudioPlayer } from '@discordjs/voice';
 import { AudioPlayerStatus, createAudioPlayer, createAudioResource, StreamType } from '@discordjs/voice';
 import { createLogger } from '../utils/logger.js';
 import { getRuntime, getStatus, updateStatus } from '../state/bridge-state.js';
-import { loadConfig, requireDeviceConfig } from '../config/env.js';
+import { loadConfig } from '../config/env.js';
 import { ConfigError, NotConnectedError, RelayAlreadyRunningError } from '../utils/errors.js';
 import { PcmMixer } from '../audio/pcm-mixer.js';
-import { startVirtualOutput } from '../audio/virtual-output.js';
-import { startVirtualInput } from '../audio/virtual-input.js';
+import { resampleFromMono, resampleToMono } from '../audio/resampler.js';
 import { attachReceiver } from '../discord/receiver.js';
-import { VoiceActivityGate } from '../audio/voice-activity.js';
 import { applyDiscordInputGate, applyPcmGain } from '../audio/audio-gate.js';
 import { PcmRingBuffer } from '../audio/pcm-ring-buffer.js';
-import { attachMessagePosting } from './message-posting-service.js';
-import { attachUtteranceRecorder } from './utterance-recorder.js';
-import { finalizeAndPostTranscript } from './transcript-service.js';
 import { MAX_CLIP_SECONDS } from './clip-service.js';
+import { RealtimeSession, REALTIME_SAMPLE_RATE } from '../realtime/openai-realtime-client.js';
 
 const logger = createLogger('bridge-service');
 
 const FRAME_MS = 20;
 
-// WASAPI capture streams (via audify/RtAudio) have been observed to silently stop delivering
-// frames - no error callback, no exception - after certain system audio events, leaving GPT's
-// audio invisible to Discord while everything else keeps working. There's no upstream fix for
-// this, so we watch for a gap in incoming frames and reopen the device ourselves.
-const INBOUND_STALL_TIMEOUT_MS = 3000;
-const INBOUND_WATCHDOG_INTERVAL_MS = 1000;
+const REALTIME_RESTART_INITIAL_DELAY_MS = 1000;
+const REALTIME_RESTART_MAX_DELAY_MS = 30_000;
 
-// The @discordjs/voice AudioPlayer can also stop draining inboundPlaybackStream on its own side
-// (e.g. AutoPaused after a brief voice-connection hiccup that never fully recovers) - capture
-// stays healthy, VAD keeps firing off the raw stream, but the mixed audio has nowhere to go and
-// is silently dropped by the backpressure guard below. Watch for backpressure that never clears.
+// @discordjs/voice's AudioPlayer can stop draining inboundPlaybackStream on its own side
+// (e.g. AutoPaused after a brief voice-connection hiccup that never fully recovers) - the
+// mixed audio has nowhere to go and is silently dropped by the backpressure guard below.
+// Watch for backpressure that never clears.
 const INBOUND_PLAYBACK_STALL_TIMEOUT_MS = 4000;
-const OUTBOUND_RESTART_INITIAL_DELAY_MS = 1000;
-const OUTBOUND_RESTART_MAX_DELAY_MS = 30_000;
+const INBOUND_WATCHDOG_INTERVAL_MS = 1000;
 
 /**
  * Starts the audio relay for a guild in both directions: Discord speakers -> mixed -> gated ->
- * virtual device A (playback), and virtual device B (recording) -> Discord voice connection.
- * The gate implements half-duplex anti-howling: while ChatGPT Live is detected as speaking
- * (plus a release hold), Discord's audio is attenuated/muted before being written to device A.
+ * resampled -> OpenAI Realtime API, and the Realtime API's spoken response -> resampled -> mixed
+ * -> Discord voice connection. The gate implements half-duplex anti-howling: while the model is
+ * speaking (per the Realtime API's own turn-detection events), Discord's audio is
+ * attenuated/muted before being sent, except during a detected user barge-in.
  */
 export async function startRelay(guildId: string, client: Client): Promise<void> {
   const status = getStatus(guildId);
@@ -57,64 +49,115 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
   const connection = voiceConnection;
 
   const config = loadConfig();
-  const { discordToGpt: discordToGptDevice, gptToDiscord: gptToDiscordDevice } = requireDeviceConfig(config);
 
   const botUserId = client.user?.id;
   if (!botUserId) {
     throw new ConfigError('Discordクライアントが未初期化です。');
   }
 
-  runtime.client = client;
+  let userSpeaking = false;
+  let bargeInActive = false;
+
+  const refreshBargeInState = (): void => {
+    const gptSpeaking = runtime.realtimeSession?.isSpeaking() ?? false;
+    const next = config.bargeIn.enabled && gptSpeaking && userSpeaking;
+    if (next !== bargeInActive) {
+      bargeInActive = next;
+      logger.info(`賢い割り込み${next ? '開始' : '終了'}: guild=${guildId} gptPlaybackLevel=${config.bargeIn.gptPlaybackLevel}`);
+    }
+    updateStatus(guildId, {
+      bargeInActive,
+      discordInputGateOpen: !gptSpeaking || bargeInActive,
+    });
+  };
 
   try {
-    const vadGate = new VoiceActivityGate(config.vad.threshold, config.vad.gptSpeakingHoldMs);
-    const speakingDiscordUsers = new Set<string>();
-    let bargeInActive = false;
-
-    const refreshBargeInState = (): void => {
-      const next = config.bargeIn.enabled && vadGate.isSpeaking() && speakingDiscordUsers.size > 0;
-      if (next !== bargeInActive) {
-        bargeInActive = next;
-        logger.info(
-          `賢い割り込み${next ? '開始' : '終了'}: guild=${guildId} ` +
-            `gptPlaybackLevel=${config.bargeIn.gptPlaybackLevel}`,
-        );
-      }
-      updateStatus(guildId, {
-        bargeInActive,
-        discordInputGateOpen: !vadGate.isSpeaking() || bargeInActive,
-      });
-    };
-
-    vadGate.on('speaking', (speaking) => {
-      updateStatus(guildId, { gptSpeaking: speaking });
-      refreshBargeInState();
-      logger.info(`GPT発話${speaking ? '開始' : '終了'}: guild=${guildId}`);
-      logger.info(
-        `Discord入力ゲート${!speaking || bargeInActive ? '開放' : '閉鎖'}: guild=${guildId} ` +
-          `(ducking=${config.vad.ducking})`,
-      );
-    });
-    runtime.vadGate = vadGate;
-
-    // --- ChatGPT Live -> Discord (read from virtual device B, also feeds VAD) ---
+    // --- OpenAI Realtime API <-> Discord (audio both directions over one WebSocket session) ---
     const inboundFrameSizeSamples = Math.round((config.output.sampleRate * FRAME_MS) / 1000);
+    const gptAudioStream = new PassThrough({ highWaterMark: 1 << 20 });
 
-    let inboundAudio = startVirtualInput(
-      gptToDiscordDevice,
-      config.output.sampleRate,
-      config.output.channels,
-      inboundFrameSizeSamples,
-      () => updateStatus(guildId, { inboundAudioRunning: false }),
-    );
-    let lastGptDataAt = Date.now();
-    inboundAudio.stream.on('data', (chunk: Buffer) => {
-      lastGptDataAt = Date.now();
-      vadGate.observeGptFrame(chunk);
-    });
+    let realtimeGeneration = 0;
+    let realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
+
+    function bindRealtimeSession(session: RealtimeSession, generation: number): void {
+      session.on('audioDelta', (pcm24kMono) => {
+        if (gptAudioStream.destroyed) return;
+        gptAudioStream.write(resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels));
+      });
+      session.on('speakingChanged', (speaking) => {
+        updateStatus(guildId, { gptSpeaking: speaking });
+        refreshBargeInState();
+        logger.info(`GPT発話${speaking ? '開始' : '終了'}: guild=${guildId}`);
+      });
+      session.on('userSpeechStarted', () => {
+        userSpeaking = true;
+        refreshBargeInState();
+      });
+      session.on('userSpeechStopped', () => {
+        userSpeaking = false;
+        refreshBargeInState();
+      });
+      session.on('error', (err) => {
+        logger.error(`Realtimeセッションでエラーが発生しました: guild=${guildId}`, err);
+      });
+      session.on('close', () => {
+        queueMicrotask(() => {
+          if (generation === realtimeGeneration) scheduleRealtimeRestart('接続が切断された');
+        });
+      });
+    }
+
+    async function openRealtimeSession(): Promise<RealtimeSession> {
+      const generation = ++realtimeGeneration;
+      const session = await RealtimeSession.connect({
+        apiKey: config.openai.apiKey,
+        model: config.openai.model,
+        voice: config.openai.voice,
+        instructions: config.airReading.enabled ? config.airReading.prompt : '',
+      });
+      bindRealtimeSession(session, generation);
+      return session;
+    }
+
+    function scheduleRealtimeRestart(reason: string): void {
+      if (!runtime.realtimeRecoveryActive || runtime.realtimeRestartTimer) return;
+
+      runtime.realtimeSession = undefined;
+      realtimeGeneration += 1;
+      userSpeaking = false;
+      updateStatus(guildId, { realtimeConnected: false, gptSpeaking: false });
+      refreshBargeInState();
+
+      const delayMs = realtimeRestartDelayMs;
+      realtimeRestartDelayMs = Math.min(realtimeRestartDelayMs * 2, REALTIME_RESTART_MAX_DELAY_MS);
+      logger.warn(`Realtimeセッションを${delayMs}ms後に再接続します: guild=${guildId} reason=${reason}`);
+
+      const timer = setTimeout(() => {
+        if (runtime.realtimeRestartTimer !== timer) return;
+        runtime.realtimeRestartTimer = undefined;
+        if (!runtime.realtimeRecoveryActive) return;
+
+        openRealtimeSession()
+          .then((session) => {
+            runtime.realtimeSession = session;
+            updateStatus(guildId, { realtimeConnected: true });
+            realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
+            logger.info(`Realtimeセッションを再接続しました: guild=${guildId}`);
+          })
+          .catch((err) => {
+            logger.error(`Realtimeセッションの再接続に失敗しました: guild=${guildId}`, err);
+            scheduleRealtimeRestart('再接続に失敗');
+          });
+      }, delayMs);
+      runtime.realtimeRestartTimer = timer;
+    }
+
+    runtime.realtimeRecoveryActive = true;
+    const realtimeSession = await openRealtimeSession();
+    runtime.realtimeSession = realtimeSession;
 
     // Keep the last 60 seconds of the unattenuated Discord + GPT mix. This is deliberately
-    // independent of Whisper and never grows beyond its fixed PCM allocation.
+    // independent of any transcription and never grows beyond its fixed PCM allocation.
     let clipMixer: PcmMixer | undefined;
     let clipDiscordStream: PassThrough | undefined;
     let clipRingBuffer: PcmRingBuffer | undefined;
@@ -128,7 +171,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
         (frame) => clipRingBuffer?.push(frame),
       );
       clipMixer.addSource('discord', clipDiscordStream);
-      clipMixer.addSource('gpt', inboundAudio.stream);
+      clipMixer.addSource('gpt', gptAudioStream);
       clipMixer.start();
       runtime.clipMixer = clipMixer;
       runtime.clipDiscordStream = clipDiscordStream;
@@ -139,19 +182,8 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       );
     }
 
-    // Jitter-buffer the captured audio on the same fixed 20ms tick used for the outbound side,
-    // instead of handing the raw native-callback stream straight to Discord. audify's capture
-    // callback timing can wobble under Node event-loop load (GC, decoding, etc.); without this
-    // buffer, that wobble was audible as intermittent cutouts in ChatGPT Live's voice in the VC.
-    //
-    // The highWaterMark here is deliberately small (a handful of frames, not Node's default of
-    // many KB/MB): this stream sits between our own 20ms producer tick and whatever pace
-    // @discordjs/voice's AudioPlayer actually drains it at. A large buffer let any tiny,
-    // persistent mismatch between those two independent clocks silently accumulate - production
-    // was very slightly faster than consumption, and because writes were never gated on
-    // backpressure, unread audio piled up over the course of a session until multiple seconds of
-    // GPT's speech were sitting in the buffer before ever reaching Discord. Capping the buffer and
-    // dropping frames while backpressured keeps that lag bounded to tens of milliseconds instead.
+    // Jitter-buffer the Realtime API's audio on the same fixed 20ms tick used for the outbound
+    // side, instead of handing bursty WebSocket delta chunks straight to Discord.
     const inboundFrameBytes = inboundFrameSizeSamples * config.output.channels * 2;
     function createPlaybackStream(): PassThrough {
       const stream = new PassThrough({ highWaterMark: inboundFrameBytes * 4 });
@@ -175,7 +207,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
         }
       },
     );
-    inboundMixer.addSource('gpt', inboundAudio.stream);
+    inboundMixer.addSource('gpt', gptAudioStream);
     inboundMixer.start();
 
     function bindAudioPlayer(player: AudioPlayer): void {
@@ -198,108 +230,9 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     bindAudioPlayer(audioPlayer);
     let hasStartedPlaying = false;
 
-    runtime.inboundAudio = inboundAudio;
     runtime.inboundMixer = inboundMixer;
     runtime.inboundPlaybackStream = inboundPlaybackStream;
     runtime.audioPlayer = audioPlayer;
-
-    // --- Optional: "投稿して" voice-triggered Discord text posting (STT-based, off the live path) ---
-    let messagePosting: ReturnType<typeof attachMessagePosting> | undefined;
-    if (config.messagePosting.enabled && config.messagePosting.channelId) {
-      // Separate, longer-hold gate used only for message-posting capture: GPT_SPEAKING_HOLD_MS is
-      // tuned to reopen Discord's mic quickly, which is far too short to survive natural pauses
-      // within a single spoken reply (using it there truncated captures to just the first phrase).
-      const postingSpeakingGate = new VoiceActivityGate(config.vad.threshold, config.messagePosting.replyHoldMs);
-      runtime.postingSpeakingGate = postingSpeakingGate;
-      inboundAudio.stream.on('data', (chunk: Buffer) => postingSpeakingGate.observeGptFrame(chunk));
-
-      messagePosting = attachMessagePosting({
-        client,
-        channelId: config.messagePosting.channelId,
-        triggerKeywords: config.messagePosting.triggerKeywords,
-        vadGate: postingSpeakingGate,
-        gptAudioStream: inboundAudio.stream,
-        gptSampleRate: config.output.sampleRate,
-        gptChannels: config.output.channels,
-        discordSampleRate: config.input.sampleRate,
-        discordChannels: config.input.channels,
-      });
-    } else if (config.messagePosting.enabled) {
-      logger.warn(`MESSAGE_POST_ENABLED=trueですが MESSAGE_POST_CHANNEL_ID が未設定のため投稿機能を無効化します: guild=${guildId}`);
-    }
-    runtime.messagePostingHandle = messagePosting;
-
-    // --- Durable utterance event foundation for optional post-session logs ---
-    let utteranceRecorder: ReturnType<typeof attachUtteranceRecorder> | undefined;
-    if (config.transcriptLog.enabled) {
-      const utteranceSpeakingGate = new VoiceActivityGate(
-        config.vad.threshold,
-        config.transcriptLog.gptUtteranceHoldMs,
-      );
-      runtime.utteranceSpeakingGate = utteranceSpeakingGate;
-      inboundAudio.stream.on('data', (chunk: Buffer) => utteranceSpeakingGate.observeGptFrame(chunk));
-
-      utteranceRecorder = attachUtteranceRecorder({
-        vadGate: utteranceSpeakingGate,
-        gptAudioStream: inboundAudio.stream,
-        gptSampleRate: config.output.sampleRate,
-        gptChannels: config.output.channels,
-        discordSampleRate: config.input.sampleRate,
-        discordChannels: config.input.channels,
-      });
-    }
-    runtime.utteranceRecorder = utteranceRecorder;
-
-    // --- Watchdog: reopen inboundAudio if its capture stream goes quiet without erroring ---
-    function restartInboundAudio(): void {
-      logger.warn(
-        `GPT音声入力が${INBOUND_STALL_TIMEOUT_MS}ms間途絶えたため再接続します: guild=${guildId}`,
-      );
-      try {
-        inboundAudio.close();
-      } catch (err) {
-        logger.warn(`旧GPT音声入力の停止中にエラー: guild=${guildId}`, err);
-      }
-
-      try {
-        inboundAudio = startVirtualInput(
-          gptToDiscordDevice,
-          config.output.sampleRate,
-          config.output.channels,
-          inboundFrameSizeSamples,
-          () => updateStatus(guildId, { inboundAudioRunning: false }),
-        );
-      } catch (err) {
-        logger.error(`GPT音声入力の再接続に失敗しました: guild=${guildId}`, err);
-        updateStatus(guildId, { inboundAudioRunning: false });
-        return;
-      }
-
-      runtime.inboundAudio = inboundAudio;
-      lastGptDataAt = Date.now();
-      inboundAudio.stream.on('data', (chunk: Buffer) => {
-        lastGptDataAt = Date.now();
-        vadGate.observeGptFrame(chunk);
-      });
-      if (runtime.postingSpeakingGate) {
-        const gate = runtime.postingSpeakingGate;
-        inboundAudio.stream.on('data', (chunk: Buffer) => gate.observeGptFrame(chunk));
-      }
-      if (runtime.utteranceSpeakingGate) {
-        const gate = runtime.utteranceSpeakingGate;
-        inboundAudio.stream.on('data', (chunk: Buffer) => gate.observeGptFrame(chunk));
-      }
-      runtime.messagePostingHandle?.replaceGptAudioStream(inboundAudio.stream);
-      runtime.utteranceRecorder?.replaceGptAudioStream(inboundAudio.stream);
-
-      inboundMixer.removeSource('gpt');
-      inboundMixer.addSource('gpt', inboundAudio.stream);
-      clipMixer?.removeSource('gpt');
-      clipMixer?.addSource('gpt', inboundAudio.stream);
-
-      updateStatus(guildId, { inboundAudioRunning: true });
-      logger.info(`GPT音声入力を再接続しました: guild=${guildId}`);
-    }
 
     // --- Watchdog: rebuild the playback pipeline if Discord-side consumption stalls ---
     function restartInboundPlayback(reason: string): void {
@@ -333,9 +266,6 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
 
     runtime.inboundWatchdog = setInterval(() => {
       const now = Date.now();
-      if (now - lastGptDataAt > INBOUND_STALL_TIMEOUT_MS) {
-        restartInboundAudio();
-      }
       // Confirmed by observation (see stateChange log above): the AudioPlayer can drop to Idle
       // entirely on its own mid-session, with no error and no backpressure on our side - this is
       // the primary recovery path. The backpressure check below is a fallback for the other
@@ -347,112 +277,24 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       }
     }, INBOUND_WATCHDOG_INTERVAL_MS);
 
-    const onUserUtterance =
-      messagePosting || utteranceRecorder
-        ? (userId: string, pcm: Buffer, timestamp: Date): void => {
-            messagePosting?.observeUserUtterance(userId, pcm);
-            utteranceRecorder?.observeUserUtterance(userId, pcm, timestamp);
-          }
-        : undefined;
-
-    // --- Discord -> ChatGPT Live (mixed, gated, write to virtual device A) ---
-    const outboundFrameSizeSamples = Math.round((config.input.sampleRate * FRAME_MS) / 1000);
-    let outboundAudio: ReturnType<typeof startVirtualOutput> | undefined;
-    let outboundRestartDelayMs = OUTBOUND_RESTART_INITIAL_DELAY_MS;
-    let outboundGeneration = 0;
-
-    function scheduleOutboundRestart(reason: string): void {
-      if (!runtime.outboundRecoveryActive || runtime.outboundRestartTimer) return;
-
-      const failedHandle = runtime.outboundAudio;
-      outboundAudio = undefined;
-      outboundGeneration += 1;
-      updateStatus(guildId, { outboundAudioRunning: false });
-
-      const delayMs = outboundRestartDelayMs;
-      outboundRestartDelayMs = Math.min(outboundRestartDelayMs * 2, OUTBOUND_RESTART_MAX_DELAY_MS);
-      logger.warn(`Discord音声出力を${delayMs}ms後に再接続します: guild=${guildId} reason=${reason}`);
-
-      const timer = setTimeout(() => {
-        if (runtime.outboundRestartTimer !== timer) return;
-        runtime.outboundRestartTimer = undefined;
-        if (!runtime.outboundRecoveryActive) return;
-
-        if (failedHandle && runtime.outboundAudio === failedHandle) {
-          failedHandle.close();
-          runtime.outboundAudio = undefined;
-        }
-
-        try {
-          outboundAudio = openOutboundAudio();
-          runtime.outboundAudio = outboundAudio;
-          updateStatus(guildId, { outboundAudioRunning: true });
-          logger.info(`Discord音声出力を再接続しました: guild=${guildId}`);
-        } catch (err) {
-          logger.error(`Discord音声出力の再接続に失敗しました: guild=${guildId}`, err);
-          scheduleOutboundRestart('デバイスの再オープンに失敗');
-        }
-      }, delayMs);
-      runtime.outboundRestartTimer = timer;
-    }
-
-    function openOutboundAudio(): ReturnType<typeof startVirtualOutput> {
-      const generation = ++outboundGeneration;
-      return startVirtualOutput(
-        discordToGptDevice,
-        config.input.sampleRate,
-        config.input.channels,
-        outboundFrameSizeSamples,
-        (message) => {
-          queueMicrotask(() => {
-            if (generation === outboundGeneration) scheduleOutboundRestart(message);
-          });
-        },
-      );
-    }
-
+    // --- Discord -> OpenAI Realtime API (mixed, gated, resampled, sent over the WebSocket) ---
     const mixer = new PcmMixer(
       { sampleRate: config.input.sampleRate, channels: config.input.channels, frameMs: FRAME_MS },
       (frame) => {
         clipDiscordStream?.write(frame);
-        const gated = applyDiscordInputGate(frame, vadGate.isSpeaking() && !bargeInActive, {
+        const gptSpeaking = runtime.realtimeSession?.isSpeaking() ?? false;
+        const gated = applyDiscordInputGate(frame, gptSpeaking && !bargeInActive, {
           ducking: config.vad.ducking,
           duckingLevel: config.vad.duckingLevel,
         });
-        if (!outboundAudio) return;
-        try {
-          outboundAudio.write(gated);
-          outboundRestartDelayMs = OUTBOUND_RESTART_INITIAL_DELAY_MS;
-        } catch (err) {
-          logger.error(`Discord音声出力の書き込みに失敗しました: guild=${guildId}`, err);
-          scheduleOutboundRestart('音声フレームの書き込みに失敗');
-        }
+        runtime.realtimeSession?.appendAudio(
+          resampleToMono(gated, config.input.sampleRate, config.input.channels, REALTIME_SAMPLE_RATE),
+        );
       },
     );
 
-    runtime.outboundRecoveryActive = true;
-    outboundAudio = openOutboundAudio();
-
-    runtime.outboundAudio = outboundAudio;
     runtime.mixer = mixer;
-    runtime.receiverHandle = attachReceiver(
-      connection,
-      botUserId,
-      mixer,
-      config.input.sampleRate,
-      config.input.channels,
-      onUserUtterance,
-      (userId, speaking) => {
-        if (speaking) speakingDiscordUsers.add(userId);
-        else speakingDiscordUsers.delete(userId);
-        refreshBargeInState();
-      },
-      {
-        threshold: config.bargeIn.voiceThreshold,
-        attackMs: config.bargeIn.attackMs,
-        releaseMs: config.bargeIn.releaseMs,
-      },
-    );
+    runtime.receiverHandle = attachReceiver(connection, botUserId, mixer, config.input.sampleRate, config.input.channels);
     mixer.start();
 
     const resource = createAudioResource(inboundPlaybackStream, { inputType: StreamType.Raw });
@@ -461,21 +303,16 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
 
     updateStatus(guildId, {
       relayRunning: true,
-      outboundAudioRunning: true,
-      inboundAudioRunning: true,
-      outputDeviceName: discordToGptDevice,
-      inputDeviceName: gptToDiscordDevice,
-      gptSpeaking: vadGate.isSpeaking(),
-      discordInputGateOpen: !vadGate.isSpeaking() || bargeInActive,
+      realtimeConnected: true,
+      gptSpeaking: realtimeSession.isSpeaking(),
+      discordInputGateOpen: !realtimeSession.isSpeaking() || bargeInActive,
       bargeInActive,
       clipBufferRunning: !!clipRingBuffer,
     });
 
     logger.info(
-      `中継開始: guild=${guildId} discordToGpt="${discordToGptDevice}" gptToDiscord="${gptToDiscordDevice}" ` +
-        `vadThreshold=${config.vad.threshold} holdMs=${config.vad.gptSpeakingHoldMs} ducking=${config.vad.ducking} ` +
-        `bargeInThreshold=${config.bargeIn.voiceThreshold} attackMs=${config.bargeIn.attackMs} ` +
-        `releaseMs=${config.bargeIn.releaseMs}`,
+      `中継開始: guild=${guildId} model=${config.openai.model} voice=${config.openai.voice} ` +
+        `ducking=${config.vad.ducking} bargeIn=${config.bargeIn.enabled}`,
     );
   } catch (err) {
     await stopRelay(guildId);
@@ -492,32 +329,14 @@ export async function stopRelay(guildId: string): Promise<void> {
     runtime.inboundWatchdog = undefined;
   }
 
-  runtime.outboundRecoveryActive = false;
-  if (runtime.outboundRestartTimer) {
-    clearTimeout(runtime.outboundRestartTimer);
-    runtime.outboundRestartTimer = undefined;
+  runtime.realtimeRecoveryActive = false;
+  if (runtime.realtimeRestartTimer) {
+    clearTimeout(runtime.realtimeRestartTimer);
+    runtime.realtimeRestartTimer = undefined;
   }
-
-  runtime.messagePostingHandle?.detach();
-  runtime.messagePostingHandle = undefined;
-
-  runtime.postingSpeakingGate?.destroy();
-  runtime.postingSpeakingGate = undefined;
 
   runtime.receiverHandle?.detach();
   runtime.receiverHandle = undefined;
-
-  if (runtime.utteranceRecorder && runtime.client) {
-    const utterances = await runtime.utteranceRecorder.detach();
-    const client = runtime.client;
-    finalizeAndPostTranscript(guildId, client, utterances).catch((err) =>
-      logger.error(`会話ログの文字起こし処理に失敗しました: guild=${guildId}`, err),
-    );
-  }
-  runtime.utteranceRecorder = undefined;
-
-  runtime.utteranceSpeakingGate?.destroy();
-  runtime.utteranceSpeakingGate = undefined;
 
   runtime.mixer?.stop();
   runtime.mixer = undefined;
@@ -529,8 +348,8 @@ export async function stopRelay(guildId: string): Promise<void> {
   runtime.clipRingBuffer?.clear();
   runtime.clipRingBuffer = undefined;
 
-  runtime.outboundAudio?.close();
-  runtime.outboundAudio = undefined;
+  runtime.realtimeSession?.close();
+  runtime.realtimeSession = undefined;
 
   runtime.audioPlayer?.stop();
   runtime.audioPlayer = undefined;
@@ -541,16 +360,9 @@ export async function stopRelay(guildId: string): Promise<void> {
   runtime.inboundPlaybackStream?.destroy();
   runtime.inboundPlaybackStream = undefined;
 
-  runtime.inboundAudio?.close();
-  runtime.inboundAudio = undefined;
-
-  runtime.vadGate?.destroy();
-  runtime.vadGate = undefined;
-
   updateStatus(guildId, {
     relayRunning: false,
-    outboundAudioRunning: false,
-    inboundAudioRunning: false,
+    realtimeConnected: false,
     gptSpeaking: false,
     discordInputGateOpen: true,
     bargeInActive: false,

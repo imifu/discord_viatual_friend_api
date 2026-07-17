@@ -9,25 +9,19 @@ import { AppError, NotInVoiceChannelError, toUserMessage } from '../utils/errors
 import { joinChannel, leaveChannel, isConnected } from './voice-connection.js';
 import { getStatus } from '../state/bridge-state.js';
 import { loadConfig } from '../config/env.js';
-import { listDevices, formatDeviceList } from '../audio/device-list.js';
 import { startRelay, stopRelay } from '../services/bridge-service.js';
 import { MAX_CLIP_SECONDS, saveRecentClip } from '../services/clip-service.js';
-import { writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
 
 const logger = createLogger('commands');
-
-const DISCORD_MESSAGE_LIMIT = 1900;
 
 export const commandDefinitions = [
   new SlashCommandBuilder().setName('join').setDescription('あなたが参加しているボイスチャンネルにBotを参加させます'),
   new SlashCommandBuilder().setName('leave').setDescription('Botをボイスチャンネルから退出させます'),
-  new SlashCommandBuilder().setName('start').setDescription('Discord <-> ChatGPT Live の音声中継を開始します'),
+  new SlashCommandBuilder().setName('start').setDescription('Discord <-> OpenAI Realtime API の音声中継を開始します'),
   new SlashCommandBuilder().setName('stop').setDescription('音声中継を停止します'),
   new SlashCommandBuilder()
     .setName('gpt')
     .setDescription('あなたのボイスチャンネルに参加し、そのまま音声中継を開始します(/join + /start)'),
-  new SlashCommandBuilder().setName('devices').setDescription('利用可能な音声入出力デバイスの一覧を表示します'),
   new SlashCommandBuilder().setName('status').setDescription('現在の中継・接続状態を表示します'),
   new SlashCommandBuilder()
     .setName('clip')
@@ -41,7 +35,7 @@ export const commandDefinitions = [
     ),
   new SlashCommandBuilder()
     .setName('airprompt')
-    .setDescription('ChatGPT Liveへ設定する空気読みモード用プロンプトを表示します'),
+    .setDescription('現在Realtimeセッションに設定されている性格プロンプト(instructions)を表示します'),
 ].map((builder) => builder.toJSON());
 
 type Handler = (interaction: ChatInputCommandInteraction) => Promise<void>;
@@ -78,33 +72,11 @@ async function handleChatgpt(interaction: ChatInputCommandInteraction): Promise<
   await interaction.editReply(`「${channel.name}」に参加し、音声中継を開始しました。`);
 }
 
-async function handleDevices(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply();
-  const result = await listDevices();
-  const text = formatDeviceList(result);
-  console.log(text);
-
-  if (text.length <= DISCORD_MESSAGE_LIMIT) {
-    await interaction.editReply(`\`\`\`\n${text}\n\`\`\``);
-    return;
-  }
-
-  const dir = join(process.cwd(), 'tmp');
-  await mkdir(dir, { recursive: true });
-  const filePath = join(dir, `devices-${Date.now()}.txt`);
-  await writeFile(filePath, text, 'utf8');
-  logger.info(`デバイス一覧が長いためファイルに保存しました: ${filePath}`);
-  await interaction.editReply({
-    content: '一覧が長いためファイルとして出力しました(コンソールにも出力済みです)。',
-    files: [filePath],
-  });
-}
-
 async function handleStart(interaction: ChatInputCommandInteraction): Promise<void> {
   const guildId = interaction.guildId!;
   await interaction.deferReply();
   await startRelay(guildId, interaction.client);
-  await interaction.editReply('DiscordとGPTを接続しました。音声中継を開始します。');
+  await interaction.editReply('OpenAI Realtime APIに接続しました。音声中継を開始します。');
 }
 
 async function handleStop(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -127,14 +99,10 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
   const lines = [
     `VC接続状態: ${isConnected(guildId) ? '接続中' : '未接続'}${status.voiceChannelId ? ` (channel: ${status.voiceChannelId})` : ''}`,
     `中継状態: ${status.relayRunning ? '実行中' : '停止中'}`,
-    `入力デバイス (GPT_TO_DISCORD_DEVICE): ${status.inputDeviceName ?? config.devices.gptToDiscord ?? '(未設定)'}`,
-    `出力デバイス (DISCORD_TO_GPT_DEVICE): ${status.outputDeviceName ?? config.devices.discordToGpt ?? '(未設定)'}`,
-    `出力(Discord→GPT, RtAudio/WASAPI): ${status.outboundAudioRunning ? '起動中' : '停止'}`,
-    `入力(GPT→Discord, RtAudio/WASAPI): ${status.inboundAudioRunning ? '起動中' : '停止'}`,
+    `OpenAI Realtime API: ${status.realtimeConnected ? '接続中' : '未接続'} (model=${config.openai.model}, voice=${config.openai.voice})`,
     `GPT発話状態: ${status.gptSpeaking ? '発話中' : '待機中'}`,
     `Discord入力ゲート: ${status.discordInputGateOpen ? '開放' : '閉鎖/減衰中'}`,
-    `賢い割り込み: ${!config.bargeIn.enabled ? '無効' : status.bargeInActive ? '割り込み中' : '待機中'} ` +
-      `(threshold=${config.bargeIn.voiceThreshold}, attack=${config.bargeIn.attackMs}ms, release=${config.bargeIn.releaseMs}ms)`,
+    `賢い割り込み: ${!config.bargeIn.enabled ? '無効' : status.bargeInActive ? '割り込み中' : '待機中'}`,
     `クリップ用60秒バッファ: ${status.clipBufferRunning ? '記録中' : '停止'}`,
     `空気読みプロンプト: ${config.airReading.enabled ? '有効' : '無効'}`,
     `エラー状態: ${status.lastError ? `${status.lastError} (${status.lastErrorAt?.toISOString()})` : 'なし'}`,
@@ -157,7 +125,7 @@ async function handleClip(interaction: ChatInputCommandInteraction): Promise<voi
 async function handleAirPrompt(interaction: ChatInputCommandInteraction): Promise<void> {
   const { airReading } = loadConfig();
   const content = airReading.enabled
-    ? `ChatGPT Liveの指示へ設定してください。\n\n\`\`\`text\n${airReading.prompt}\n\`\`\``
+    ? `現在OpenAI Realtime APIのセッションに自動設定されている性格プロンプトです(手動での貼り付けは不要です)。\n\n\`\`\`text\n${airReading.prompt}\n\`\`\``
     : '空気読みモードは AIR_READING_ENABLED=false で無効になっています。';
   await interaction.reply({ content, flags: MessageFlags.Ephemeral });
 }
@@ -168,7 +136,6 @@ const handlers: Record<string, Handler> = {
   start: handleStart,
   stop: handleStop,
   gpt: handleChatgpt,
-  devices: handleDevices,
   status: handleStatus,
   clip: handleClip,
   airprompt: handleAirPrompt,

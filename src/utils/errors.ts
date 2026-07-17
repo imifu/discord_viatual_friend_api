@@ -19,21 +19,21 @@ export class ConfigError extends AppError {
   }
 }
 
-export class DeviceNotFoundError extends AppError {
-  constructor(deviceName: string, direction: 'input' | 'output') {
+export class OpenAIConnectionError extends AppError {
+  constructor(cause?: unknown) {
     super(
-      `音声デバイスが見つかりません(${direction === 'input' ? '入力' : '出力'}): "${deviceName}"。/devices で一覧を確認してください。`,
-      `DeviceNotFoundError: direction=${direction} name="${deviceName}"`,
+      'OpenAI Realtime APIへの接続に失敗しました。OPENAI_API_KEYが正しいか、ネットワーク状態を確認してください。',
+      'OpenAIConnectionError',
+      { cause },
     );
   }
 }
 
-export class AudioStreamOpenError extends AppError {
-  constructor(deviceName: string, direction: 'input' | 'output', cause?: unknown) {
+export class OpenAISessionError extends AppError {
+  constructor(message: string, cause?: unknown) {
     super(
-      `音声デバイスを開始できませんでした(${direction === 'input' ? '入力' : '出力'}): "${deviceName}"。` +
-        '他のアプリで使用中でないか、デバイス名が正しいか確認してください。',
-      `AudioStreamOpenError: direction=${direction} name="${deviceName}"`,
+      `OpenAI Realtime APIとのセッションでエラーが発生しました: ${message}`,
+      `OpenAISessionError: ${message}`,
       { cause },
     );
   }
