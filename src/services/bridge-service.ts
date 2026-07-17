@@ -37,6 +37,16 @@ const INBOUND_WATCHDOG_INTERVAL_MS = 1000;
 
 const IDLE_CHECK_INTERVAL_MS = 30_000;
 
+// The Realtime API does not pace audio delivery to the reply's actual spoken duration - it sends
+// a whole reply's audio across a handful of large chunks within a second or two of wall-clock
+// time, arriving far faster than real-time. PcmMixer's default ~500ms jitter-buffer cap (tuned
+// for Discord users' roughly real-time-paced Opus packets) can't hold a burst like that, so it
+// continuously evicted older frames to make room for newer ones - audibly corrupting/truncating
+// the model's replies into fast, garbled fragments. Sources carrying the model's own audio
+// (`gptAudioStream`, fed into inboundMixer and clipMixer below) need a buffer generous enough to
+// hold a full reply without dropping anything; 30s covers any realistic single turn.
+const GPT_AUDIO_MAX_BUFFERED_FRAMES = (30 * 1000) / FRAME_MS;
+
 /**
  * Starts the audio relay for a guild in both directions: Discord speakers -> mixed -> resampled
  * -> OpenAI Realtime API (always at full volume, never locally gated, so the API's own
@@ -238,7 +248,12 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       clipRingBuffer = new PcmRingBuffer(config.input.sampleRate, config.input.channels, MAX_CLIP_SECONDS);
       clipDiscordStream = new PassThrough();
       clipMixer = new PcmMixer(
-        { sampleRate: config.input.sampleRate, channels: config.input.channels, frameMs: FRAME_MS },
+        {
+          sampleRate: config.input.sampleRate,
+          channels: config.input.channels,
+          frameMs: FRAME_MS,
+          maxBufferedFrames: GPT_AUDIO_MAX_BUFFERED_FRAMES,
+        },
         (frame) => clipRingBuffer?.push(frame),
       );
       clipMixer.addSource('discord', clipDiscordStream);
@@ -268,7 +283,12 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     let inboundBackpressured = false;
     let backpressureSince: number | null = null;
     const inboundMixer = new PcmMixer(
-      { sampleRate: config.output.sampleRate, channels: config.output.channels, frameMs: FRAME_MS },
+      {
+        sampleRate: config.output.sampleRate,
+        channels: config.output.channels,
+        frameMs: FRAME_MS,
+        maxBufferedFrames: GPT_AUDIO_MAX_BUFFERED_FRAMES,
+      },
       (frame) => {
         if (inboundPlaybackStream.destroyed || inboundBackpressured) return;
         const playbackFrame = bargeInActive ? applyPcmGain(frame, config.bargeIn.gptPlaybackLevel) : frame;
