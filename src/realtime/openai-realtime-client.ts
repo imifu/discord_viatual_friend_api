@@ -178,6 +178,32 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     this.ws.send({ type: 'response.create' });
   }
 
+  /**
+   * Like requestResponse(), but avoids the API rejecting the request because a response is
+   * already in flight (the Realtime API only allows one active response per conversation at a
+   * time): if the model is currently speaking, waits for the in-flight response to finish
+   * (speakingChanged(false)) before sending response.create. Returns whether the request was
+   * sent immediately (true) or deferred (false), so callers can give the user accurate feedback.
+   */
+  requestResponseWhenIdle(): boolean {
+    if (!this.speaking) {
+      this.requestResponse();
+      return true;
+    }
+    // Use on()+manual removal rather than once(): once() would consume itself on the first
+    // speakingChanged event regardless of its value, so if that first event happened to fire
+    // with `true` (not expected from setSpeaking()'s own transition-only guard today, but this
+    // shouldn't depend on that), the deferred request would be silently dropped forever instead
+    // of still waiting for the eventual `false`.
+    const onSpeakingChanged = (speaking: boolean): void => {
+      if (speaking) return;
+      this.off('speakingChanged', onSpeakingChanged);
+      this.requestResponse();
+    };
+    this.on('speakingChanged', onSpeakingChanged);
+    return false;
+  }
+
   close(): void {
     this.ws.close();
   }

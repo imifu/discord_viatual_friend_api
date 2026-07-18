@@ -141,12 +141,15 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
 
   // Issue #19 (Issue #6 Step 2): 中継中(/start済み)ならRealtime APIへも送信し、AIに即座に
   // 反応させる。中継していなければ従来通り画像を投稿するだけで、API利用料金は発生しない。
+  // Realtime APIは同時に1つの応答しか受け付けないため、AI発話中はrequestResponseWhenIdle()が
+  // 応答要求を発話終了まで自動的に遅らせる(Codexレビュー: 発話中でも即座に反応するかのように
+  // 表示していた問題への対応)。
   const session = getRuntime(guildId).realtimeSession;
   let content = '今見えてる光景を送るよ！こんなかんじです！';
   if (session) {
     session.appendImage(jpeg, video.captureDetail);
-    session.requestResponse();
-    content += '(AIにも送ったよ、反応するね！)';
+    const respondedImmediately = session.requestResponseWhenIdle();
+    content += respondedImmediately ? '(AIにも送ったよ、反応するね！)' : '(AIにも送ったよ、今の発話が終わったら反応するね！)';
   } else {
     content += '(/startしてないから、AIにはまだ送ってないよ)';
   }
