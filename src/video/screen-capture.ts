@@ -53,13 +53,11 @@ export function captureFrame(options: CaptureFrameOptions): Promise<Buffer> {
     const stderrChunks: Buffer[] = [];
     let settled = false;
 
-    const timeout = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      ffmpeg.kill();
-      reject(new ScreenCaptureError(new Error(`ffmpegが${timeoutMs}ms以内に応答しませんでした`)));
-    }, timeoutMs);
-
+    // All exit paths (timeout, spawn error, process close) must go through this so
+    // captureInFlight is always released exactly once - see the timeout callback below, which
+    // used to bypass this and leave captureInFlight stuck at true forever after any timeout.
+    // `timeout` is referenced here but only initialized on the next line - safe because this
+    // body only runs later, once the `const timeout` assignment below has already completed.
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
@@ -67,6 +65,11 @@ export function captureFrame(options: CaptureFrameOptions): Promise<Buffer> {
       captureInFlight = false;
       fn();
     };
+
+    const timeout = setTimeout(() => {
+      ffmpeg.kill();
+      finish(() => reject(new ScreenCaptureError(new Error(`ffmpegが${timeoutMs}ms以内に応答しませんでした`))));
+    }, timeoutMs);
 
     ffmpeg.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
     ffmpeg.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
