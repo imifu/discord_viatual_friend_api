@@ -20,6 +20,12 @@ const CONNECT_TIMEOUT_MS = 10_000;
 // client events promptly (validation/session-state failures), so this only needs to cover that
 // round-trip, not a full response cycle - it does not wait for e.g. response.created.
 const EVENT_CONFIRM_TIMEOUT_MS = 3000;
+// Upper bound on how long requestResponse() treats the session as "a response is being
+// requested" before giving up on ever seeing speakingChanged(true) confirm it started. Bounds the
+// local response-in-flight guard below so a response.create that's accepted but never actually
+// starts (rather than erroring) can't permanently block requestResponseWhenIdle() from ever
+// sending again.
+const RESPONSE_START_TIMEOUT_MS = 15_000;
 
 interface RealtimeSessionEvents {
   /** 24kHz mono s16le PCM chunk decoded from a response.output_audio.delta event. */
@@ -79,6 +85,13 @@ function waitForSocketOpen(ws: OpenAIRealtimeWS): Promise<void> {
  */
 export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   private speaking = false;
+  /** True from the moment requestResponse() sends response.create until we know (via
+   *  speakingChanged(true), a correlated error, or RESPONSE_START_TIMEOUT_MS) whether it actually
+   *  started - covers the brief gap right after sending where `speaking` doesn't reflect it yet,
+   *  so two requestResponseWhenIdle() calls made back-to-back before the first gets confirmed
+   *  can't both see "not busy" and both send response.create (the API only allows one active
+   *  response at a time). */
+  private responsePending = false;
   /** Callbacks awaiting a possible `error` event correlated (by event_id) to a client event we sent. */
   private readonly pendingEventErrors = new Map<string, (err: OpenAISessionError) => void>();
   /** At most one pending "call requestResponse() once the model stops speaking" listener - see requestResponseWhenIdle(). */
@@ -169,8 +182,33 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
 
     this.ws.socket.on('close', () => {
       logger.warn('Realtime APIとの接続が切断されました');
+      // A remote/unexpected disconnect must clean up pending confirmations exactly like an
+      // explicit close() does - otherwise appendImage()/requestResponse() callers waiting on
+      // awaitAccepted() would just sit until their own timeout and resolve as if nothing had
+      // gone wrong, even though the connection is gone (Codexレビューで発覚: 明示的close()以外の
+      // 切断経路がpending Promiseを解決しないまま残っていた).
+      this.rejectAllPending(new OpenAISessionError('Realtime APIとの接続が切断されたため確認できませんでした'));
       this.emit('close');
     });
+  }
+
+  /** Shared cleanup for both close() and an unexpected socket disconnect: rejects every pending
+   *  appendImage()/requestResponse() confirmation and any pending deferred idle-response request. */
+  private rejectAllPending(reason: OpenAISessionError): void {
+    if (this.idleResponseListener) {
+      this.off('speakingChanged', this.idleResponseListener);
+      this.idleResponseListener = undefined;
+    }
+    if (this.idleResponseCancel) {
+      this.idleResponseCancel(reason);
+      this.idleResponseCancel = undefined;
+      this.idleResponseOutcome = undefined;
+    }
+    for (const reject of this.pendingEventErrors.values()) {
+      reject(reason);
+    }
+    this.pendingEventErrors.clear();
+    this.responsePending = false;
   }
 
   private setSpeaking(speaking: boolean): void {
@@ -234,7 +272,29 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
    */
   requestResponse(overrides?: { instructions?: string; maxOutputTokens?: number }): Promise<void> {
     const eventId = randomUUID();
+
+    this.responsePending = true;
+    let clearedBusy = false;
+    const clearBusy = (): void => {
+      if (clearedBusy) return;
+      clearedBusy = true;
+      clearTimeout(busyTimer);
+      this.off('speakingChanged', onSpeakingStarted);
+      this.responsePending = false;
+    };
+    const onSpeakingStarted = (speaking: boolean): void => {
+      // Once actually speaking, `speaking` itself is the authority - the flag has done its job
+      // of covering the gap between sending and this confirmation.
+      if (speaking) clearBusy();
+    };
+    this.on('speakingChanged', onSpeakingStarted);
+    // Bounds the gap for a response.create that's accepted (no error) but never actually starts -
+    // without this, responsePending could get stuck true forever and block all future requests.
+    const busyTimer = setTimeout(clearBusy, RESPONSE_START_TIMEOUT_MS);
+
     const confirmed = this.awaitAccepted(eventId, EVENT_CONFIRM_TIMEOUT_MS);
+    void confirmed.catch(clearBusy); // definite rejection - no response is active because of this request
+
     this.ws.send({
       type: 'response.create',
       event_id: eventId,
@@ -246,6 +306,12 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       }),
     });
     return confirmed;
+  }
+
+  /** Whether a response.create is either confirmed active (speaking) or was just sent and hasn't
+   *  been confirmed one way or the other yet (responsePending) - see requestResponse(). */
+  private get responseBusy(): boolean {
+    return this.speaking || this.responsePending;
   }
 
   /**
@@ -263,7 +329,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     instructions?: string;
     maxOutputTokens?: number;
   }): { respondedImmediately: boolean; outcome: Promise<void> } {
-    if (!this.speaking) {
+    if (!this.responseBusy) {
       return { respondedImmediately: true, outcome: this.requestResponse(overrides) };
     }
     // Coalesce: if a deferred request is already pending (e.g. /cap was run more than once while
@@ -297,19 +363,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   }
 
   close(): void {
-    if (this.idleResponseListener) {
-      this.off('speakingChanged', this.idleResponseListener);
-      this.idleResponseListener = undefined;
-    }
-    if (this.idleResponseCancel) {
-      this.idleResponseCancel(new OpenAISessionError('セッションが切断されたため応答要求を送信できませんでした'));
-      this.idleResponseCancel = undefined;
-      this.idleResponseOutcome = undefined;
-    }
-    for (const reject of this.pendingEventErrors.values()) {
-      reject(new OpenAISessionError('セッションが切断されたため確認できませんでした'));
-    }
-    this.pendingEventErrors.clear();
+    this.rejectAllPending(new OpenAISessionError('セッションが切断されたため確認できませんでした'));
     this.ws.close();
   }
 }

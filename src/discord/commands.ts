@@ -145,43 +145,41 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   const { video } = loadConfig();
   const jpeg = await captureFrame({ deviceName: video.captureDevice });
 
-  // Issue #19 (Issue #6 Step 2): 中継中(/start済み)ならRealtime APIへも送信し、AIに即座に
-  // 反応させる。中継していなければ従来通り画像を投稿するだけで、API利用料金は発生しない。
-  // Realtime APIは同時に1つの応答しか受け付けないため、AI発話中はrequestResponseWhenIdle()が
-  // 応答要求を発話終了まで自動的に遅らせ、複数回連続で実行しても1件にまとめる(Codexレビュー対応)。
-  // appendImage()/requestResponse()はevent_idで相関するAPIエラーを検知するとreject
-  // する(Codexレビュー対応: 拒否されていても成功表示していた問題)。即時応答はここでawaitし、
-  // 遅延応答は既に返信済みのためfollowUp()で後から訂正する。
+  // Issue #19 (Issue #6 Step 2、実機レビュー対応): 画像はキャプチャでき次第すぐ投稿する。
+  // appendImage()/requestResponseWhenIdle()のAPI確認(最大数秒)を待ってから投稿すると、その分
+  // 画像の表示自体が遅れてしまう(Codexレビューで指摘)ため、Discordへの返信とRealtime APIへの
+  // 送信確認を切り離した。
   const session = getRuntime(guildId).realtimeSession;
-  let content = '今見えてる光景を送るよ！こんなかんじです！';
-  if (session) {
-    try {
-      await session.appendImage(jpeg, video.captureDetail);
-      const { respondedImmediately, outcome } = session.requestResponseWhenIdle({
-        instructions: SCREEN_CAP_REACTION_INSTRUCTIONS,
-        maxOutputTokens: video.reactionMaxOutputTokens,
-      });
-      if (respondedImmediately) {
-        await outcome;
-        content += '(AIにも送ったよ、反応するね！)';
-      } else {
-        content += '(AIにも送ったよ、今の発話が終わったら反応するね！)';
-        outcome.catch((err: unknown) => {
-          logger.warn(`/cap: 発話終了後の応答要求がAPI側で拒否されました: guild=${guildId}`, err);
-          void interaction.followUp('さっき送った画像、反応できなかったみたい…ごめんね').catch(() => undefined);
-        });
-      }
-    } catch (err) {
-      logger.warn(`/cap: 画像またはAIへの応答要求がAPI側で拒否されました: guild=${guildId}`, err);
-      content += '(AIへの送信は失敗しちゃった…画像だけ見てね)';
-    }
-  } else {
-    content += '(/startしてないから、AIにはまだ送ってないよ)';
-  }
-
+  const content = session
+    ? '今見えてる光景を送るよ！こんなかんじです！(AIにも送ったよ)'
+    : '今見えてる光景を送るよ！こんなかんじです！(/startしてないから、AIにはまだ送ってないよ)';
   await interaction.editReply({
     content,
     files: [{ attachment: jpeg, name: 'cap.jpg' }],
+  });
+  if (!session) return;
+
+  // 画像追加とresponse.create(発話終了まで自動的に遅延・複数回のcoalesceも行う)は、
+  // 互いのAPI確認を待たずに直後に呼ぶ。WebSocketは1本の接続で送信順が保たれるため、
+  // conversation.item.create → response.createの順序はappendImage()の確認を待たなくても
+  // 保証される。await appendImage()してからrequestResponseWhenIdle()を呼ぶ形だと、その間に
+  // 発話終了のタイミングを逃してcoalesceが効かず、応答が2回に分かれる不具合があった
+  // (Codexレビューで発覚)。
+  const appendOutcome = session.appendImage(jpeg, video.captureDetail);
+  const { outcome: responseOutcome } = session.requestResponseWhenIdle({
+    instructions: SCREEN_CAP_REACTION_INSTRUCTIONS,
+    maxOutputTokens: video.reactionMaxOutputTokens,
+  });
+
+  // どちらも失敗を検知した場合のみフォローアップで訂正する(成功時は音声応答そのものが
+  // 確認になるため、追加のメッセージは送らない)。
+  void appendOutcome.catch((err: unknown) => {
+    logger.warn(`/cap: 画像追加がAPI側で拒否されました: guild=${guildId}`, err);
+    void interaction.followUp('さっき送った画像、AIには届かなかったみたい…ごめんね').catch(() => undefined);
+  });
+  void responseOutcome.catch((err: unknown) => {
+    logger.warn(`/cap: 応答要求がAPI側で拒否されました: guild=${guildId}`, err);
+    void interaction.followUp('さっき送った画像、反応できなかったみたい…ごめんね').catch(() => undefined);
   });
 }
 
