@@ -69,6 +69,16 @@ export class ClipUnavailableError extends AppError {
   }
 }
 
+export class ScreenCaptureError extends AppError {
+  constructor(cause?: unknown) {
+    super(
+      '画面キャプチャに失敗しました。OBS仮想カメラが起動しているか、ffmpegがインストールされPATHが通っているか確認してください。',
+      'ScreenCaptureError',
+      { cause },
+    );
+  }
+}
+
 export function toUserMessage(error: unknown): string {
   if (error instanceof AppError) return error.userMessage;
   return '予期しないエラーが発生しました。詳細はログを確認してください。';

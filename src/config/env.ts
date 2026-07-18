@@ -82,6 +82,10 @@ export interface AppConfig {
     enabled: boolean;
     prompt: string;
   };
+  video: {
+    /** Windows DirectShow device name for screen capture (OBS Virtual Camera by default). */
+    captureDevice: string;
+  };
 }
 
 let cached: AppConfig | undefined;
@@ -118,6 +122,9 @@ export function loadConfig(): AppConfig {
     airReading: {
       enabled: optionalBool('AIR_READING_ENABLED', true),
       prompt: (optionalString('AIR_READING_PROMPT') ?? DEFAULT_AIR_READING_PROMPT).replace(/\\n/g, '\n'),
+    },
+    video: {
+      captureDevice: optionalString('SCREEN_CAPTURE_DEVICE') ?? 'OBS Virtual Camera',
     },
   };
 
