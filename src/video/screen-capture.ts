@@ -16,7 +16,7 @@ export interface CaptureFrameOptions {
 // ffmpeg process launched while one is already running would just fail with a device-busy error
 // from ffmpeg itself. Reject fast with a clear message instead of spawning a second process that
 // is very likely to fail anyway. Single flag is enough: this app runs as one process, and Step 1
-// only ever has one caller (the /screencap command handler).
+// only ever has one caller (the /cap command handler).
 let captureInFlight = false;
 
 /**

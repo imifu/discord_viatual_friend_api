@@ -54,8 +54,8 @@ Discord のボイスチャンネルと OpenAI Realtime API を直接接続し、
 | Node.js (v20以上) | 実行環境 | v24 で動作確認済み |
 | npm | パッケージ管理 | |
 | OpenAI APIキー | Realtime API利用 | [OpenAI Platform](https://platform.openai.com/) で発行。Realtime APIの利用には課金が発生します |
-| ffmpeg | `/screencap`での画面キャプチャ(Issue #6 Step 1) | [公式サイト](https://ffmpeg.org/download.html)からダウンロードし、`ffmpeg`コマンドにPATHを通してください。`/screencap`を使わない場合は不要です |
-| OBS Studio(仮想カメラ) | `/screencap`でのキャプチャ対象 | OBS Studioの「仮想カメラ開始」を押すと、Windowsに`OBS Virtual Camera`というDirectShowビデオデバイスが現れます。`/screencap`を使わない場合は不要です |
+| ffmpeg | `/cap`での画面キャプチャ(Issue #6 Step 1) | [公式サイト](https://ffmpeg.org/download.html)からダウンロードし、`ffmpeg`コマンドにPATHを通してください。`/cap`を使わない場合は不要です |
+| OBS Studio(仮想カメラ) | `/cap`でのキャプチャ対象 | OBS Studioの「仮想カメラ開始」を押すと、Windowsに`OBS Virtual Camera`というDirectShowビデオデバイスが現れます。`/cap`を使わない場合は不要です |
 
 VB-CABLEやChromeなど、以前のバージョンで必要だった仮想オーディオデバイス・ブラウザは不要です。
 
@@ -164,9 +164,9 @@ OpenAI公式の料金ページ([2026年7月時点](https://platform.openai.com/d
 
 ### 画面キャプチャ(検証中、[Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6))
 
-`/screencap`は、`SCREEN_CAPTURE_DEVICE`(既定 `OBS Virtual Camera`)で指定したWindows DirectShowデバイスからffmpegで1枚だけ静止画をキャプチャし、Discordへ画像として返す検証用コマンドです。**現時点ではRealtime APIへは一切送信しておらず、OpenAI利用料金に影響しません。** OBS仮想カメラ映像をAIとの会話コンテキストへ実際に送る機能はIssue #6の後続ステップとして別途実装予定で、送信頻度・画質(`detail`)・会話コンテキストへの蓄積方法はコストに直結するため、実装前にあらためて設定を確認します。
+`/cap`は、`SCREEN_CAPTURE_DEVICE`(既定 `OBS Virtual Camera`)で指定したWindows DirectShowデバイスからffmpegで1枚だけ静止画をキャプチャし、実行したチャンネルへ画像として投稿する検証用コマンドです。**現時点ではRealtime APIへは一切送信しておらず、OpenAI利用料金に影響しません。** OBS仮想カメラ映像をAIとの会話コンテキストへ実際に送る機能はIssue #6の後続ステップとして別途実装予定で、送信頻度・画質(`detail`)・会話コンテキストへの蓄積方法はコストに直結するため、実装前にあらためて設定を確認します。
 
-Bot動作PCの画面内容(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を無関係なメンバーが閲覧できてしまわないよう、`/screencap`は既定でサーバー管理権限(`ManageGuild`)を持つメンバーのみ実行でき、応答はコマンド実行者にしか見えないephemeralメッセージになります。実行可能な範囲を変更したい場合は、サーバーの「統合」設定からコマンドごとの権限を上書きしてください。コマンド定義を変更したため、反映には `npm run register` の再実行が必要です。
+**`/cap`の取得画像は、実行したチャンネルを閲覧できるサーバーメンバー全員に見える通常メッセージとして投稿されます(ephemeralではありません、[Issue #17](https://github.com/imifu/discord_viatual_friend_api/issues/17))。** OBS仮想カメラにはゲーム画面以外の通知・別ウィンドウ・個人情報などが映り込む可能性があるため、キャプチャ対象のウィンドウ・シーンをOBS側で事前に確認し、公開してよい内容だけを仮想カメラへ出力する運用にしてください。誰でも画面を取得できてしまわないよう、`/cap`は既定でサーバー管理権限(`ManageGuild`)を持つメンバーのみ実行できます。実行可能な範囲を変更したい場合は、サーバーの「統合」設定からコマンドごとの権限を上書きしてください。コマンド定義を変更したため、反映には `npm run register` の再実行が必要です。
 
 ## 10. インストール方法
 
@@ -212,7 +212,7 @@ npm start
 9. `/clip seconds:30` でDiscordとAIの直前音声が添付されることを確認
 10. `/airprompt` で現在設定されている性格プロンプトが表示されることを確認
 11. `/stop` → `/leave` で終了
-12. (任意、[Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6) Step 1) OBS Studioで仮想カメラを開始した状態で `/screencap` を実行し、画面のキャプチャ画像がDiscordに添付されることを確認。中継(`/start`)とは無関係にいつでも実行できます
+12. (任意、[Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6) Step 1) OBS Studioで仮想カメラを開始した状態で `/cap` を実行し、画面のキャプチャ画像がチャンネルへ投稿されることを確認。中継(`/start`)とは無関係にいつでも実行できます
 
 ## 14. ハウリングした場合の対処方法
 
@@ -235,7 +235,7 @@ npm start
 - 複数ギルドでの同時運用は想定していません(1プロセスにつき実運用は1サーバー・1VCを想定。内部的にはギルドID単位で状態を保持していますが、動作確認は単一ギルドのみです)
 - OpenAI Realtime APIの利用には課金が発生します。料金体系はOpenAIの公式ドキュメントを参照してください
 - 「投稿して」音声トリガーによるテキスト投稿機能、会話ログの自動文字起こし機能は、旧バージョン(ローカルWhisper依存)からの移行中のため一時的に利用できません(復活作業は別途進行中)
-- `/screencap`によるOBS仮想カメラのキャプチャは検証用コマンドのみ実装済みで、Realtime APIへの自動送信・AIによる画面内容を踏まえた応答は未実装です([Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6)、継続対応中)
+- `/cap`によるOBS仮想カメラのキャプチャは検証用コマンドのみ実装済みで、Realtime APIへの自動送信・AIによる画面内容を踏まえた応答は未実装です([Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6)、継続対応中)。取得画像は実行チャンネルへ公開投稿されます([Issue #17](https://github.com/imifu/discord_viatual_friend_api/issues/17))
 - `Ctrl+C`(SIGINT)による終了処理は自動テストできておらず、動作確認は開発者による手動実施のみです(下記テスト手順参照)
 
 ---
@@ -270,7 +270,7 @@ npm start
 | 22 | 直前クリップ | 中継開始後に`/clip seconds:30` | DiscordとAIの直前ミックス音声WAVが添付される |
 | 23 | 空気読みプロンプト | `/airprompt` | Realtimeセッションに自動設定されているプロンプトが本人だけに表示される |
 | 24 | 無音時の自動停止 | `IDLE_TIMEOUT_MINUTES`を短く(例: 1)設定し、`/start`後に誰も話さず待つ | 設定時間経過後、ログに「発話がなかったため中継を自動停止します」が出力され、`/status`で停止状態になる |
-| 25 | 画面キャプチャ(Issue #6 Step 1) | サーバー管理権限を持つメンバーが、OBS Studioで仮想カメラを開始した状態で`/screencap` | OBS仮想カメラの映像がJPEG画像として本人だけに見えるephemeralメッセージで添付される |
-| 26 | 画面キャプチャ失敗時のエラー | OBS仮想カメラを起動していない状態、またはffmpeg未インストール/PATH未設定の状態で`/screencap` | 「画面キャプチャに失敗しました」エラーが返る |
-| 27 | 画面キャプチャの権限制限 | サーバー管理権限を持たないメンバーが`/screencap`を実行しようとする | Discord側でコマンド自体が表示されない、または実行できない(既定メンバー権限`ManageGuild`により制限) |
-| 28 | 画面キャプチャの同時実行制御 | `/screencap`実行中(応答が返る前)にもう一度`/screencap`を実行する | 2回目は「別の画面キャプチャが進行中です」エラーが返り、ffmpegプロセスが二重起動しない |
+| 25 | 画面キャプチャ(Issue #6 Step 1、#17) | サーバー管理権限を持つメンバーが、OBS Studioで仮想カメラを開始した状態で`/cap` | OBS仮想カメラの映像がJPEG画像として実行チャンネルへ通常メッセージ(非ephemeral)で投稿され、別アカウントからも見える |
+| 26 | 画面キャプチャ失敗時のエラー | OBS仮想カメラを起動していない状態、またはffmpeg未インストール/PATH未設定の状態で`/cap` | 「画面キャプチャに失敗しました」エラーが返る |
+| 27 | 画面キャプチャの権限制限 | サーバー管理権限を持たないメンバーが`/cap`を実行しようとする | Discord側でコマンド自体が表示されない、または実行できない(既定メンバー権限`ManageGuild`により制限)。旧`/screencap`も表示・実行できない |
+| 28 | 画面キャプチャの同時実行制御 | `/cap`実行中(応答が返る前)にもう一度`/cap`を実行する | 2回目は「別の画面キャプチャが進行中です」エラーが返り、ffmpegプロセスが二重起動しない |

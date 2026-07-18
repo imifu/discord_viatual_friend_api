@@ -39,10 +39,11 @@ export const commandDefinitions = [
     .setName('airprompt')
     .setDescription('現在Realtimeセッションに設定されている性格プロンプト(instructions)を表示します'),
   new SlashCommandBuilder()
-    .setName('screencap')
-    .setDescription('OBS仮想カメラから1枚キャプチャして画像として返します(検証用。Realtime APIへは送信しません)')
-    // Bot動作PCの画面(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を誰でも閲覧できてしまわないよう、
-    // 既定ではサーバー管理権限を持つメンバーのみに制限する(サーバーの「統合」設定から上書き可能)。
+    .setName('cap')
+    .setDescription('OBS仮想カメラから1枚キャプチャしてこのチャンネルへ投稿します(検証用。Realtime APIへは送信しません)')
+    // 実行者は引き続きサーバー管理権限を持つメンバーに限定する(Bot動作PCの画面を誰でも
+    // キャプチャできてしまわないようにするため)。結果はチャンネルへ公開投稿されるため、
+    // 実行できる人を絞ることが唯一の安全弁になる(サーバーの「統合」設定から上書き可能)。
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((builder) => builder.toJSON());
 
@@ -129,15 +130,16 @@ async function handleClip(interaction: ChatInputCommandInteraction): Promise<voi
   });
 }
 
-async function handleScreenCap(interaction: ChatInputCommandInteraction): Promise<void> {
-  // 検証用コマンドであり、Bot動作PCの画面内容(ゲーム画面以外を含みうる)を返すため、
-  // 実行したメンバー以外には見えないephemeral応答にする。
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+async function handleCap(interaction: ChatInputCommandInteraction): Promise<void> {
+  // Issue #17: ユーザー要望により、実行チャンネルへ見える通常メッセージとして投稿する
+  // (ephemeralにはしない)。実行者をManageGuild権限保持者に限定していることが、
+  // Bot動作PCの画面(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を守る唯一の制御になる。
+  await interaction.deferReply();
   const { video } = loadConfig();
   const jpeg = await captureFrame({ deviceName: video.captureDevice });
   await interaction.editReply({
     content: `OBS仮想カメラ(device="${video.captureDevice}")から取得した画像です(検証用。Realtime APIへは送信していません)。`,
-    files: [{ attachment: jpeg, name: 'screencap.jpg' }],
+    files: [{ attachment: jpeg, name: 'cap.jpg' }],
   });
 }
 
@@ -158,7 +160,7 @@ const handlers: Record<string, Handler> = {
   status: handleStatus,
   clip: handleClip,
   airprompt: handleAirPrompt,
-  screencap: handleScreenCap,
+  cap: handleCap,
 };
 
 export async function dispatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
