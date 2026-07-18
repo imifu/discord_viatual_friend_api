@@ -1,15 +1,37 @@
 import { spawn } from 'node:child_process';
 import { ScreenCaptureBusyError, ScreenCaptureError } from '../utils/errors.js';
 
-const DEFAULT_QUALITY = 4;
+// Capture design (fixed for now; see Issue #6 Step 1/2 discussion, tuned after real-device
+// testing): OBS's Base Canvas is 1920x1080, downscaled here to 640x360 before JPEG-encoding at
+// ~quality 65. Since SCREEN_CAPTURE_DETAIL defaults to 'low' (a fixed token cost regardless of
+// resolution), this downscale mainly reduces the base64 payload size, network transfer, and
+// send latency rather than Realtime API image-token cost. A future periodic-capture mode
+// (Issue #20 / Step 3) is intended to send at 1fps - not relevant to this single-shot capture,
+// but noted here since it uses the same encoding settings.
+const DEFAULT_OUTPUT_WIDTH = 640;
+const DEFAULT_OUTPUT_HEIGHT = 360;
+// Standard 0-100 JPEG quality convention (higher = better), converted below to ffmpeg's mjpeg
+// -q:v scale (2-31, lower = better) - ffmpeg has no direct 0-100 quality flag for this encoder.
+const DEFAULT_QUALITY = 65;
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 export interface CaptureFrameOptions {
   /** Windows DirectShow device name, e.g. "OBS Virtual Camera". */
   deviceName: string;
-  /** ffmpeg -q:v value (2-31, lower = higher quality). */
+  /** Standard 0-100 JPEG quality (higher = better). */
   quality?: number;
+  /** Output frame size in pixels; the captured frame is scaled down/up to this. */
+  outputWidth?: number;
+  outputHeight?: number;
   timeoutMs?: number;
+}
+
+/** Approximates a 0-100 JPEG quality (higher = better) as ffmpeg's mjpeg -q:v scale (2-31, lower
+ *  = better). ffmpeg has no exact standard-JPEG-quality equivalent for this encoder, so this is a
+ *  linear approximation, not a precise conversion. */
+function qualityToFfmpegQscale(quality: number): number {
+  const clamped = Math.max(0, Math.min(100, quality));
+  return Math.round(2 + (100 - clamped) * ((31 - 2) / 100));
 }
 
 // A DirectShow capture device typically only accepts one open handle at a time, so a second
@@ -31,7 +53,9 @@ export function captureFrame(options: CaptureFrameOptions): Promise<Buffer> {
   }
   captureInFlight = true;
 
-  const quality = options.quality ?? DEFAULT_QUALITY;
+  const qscale = qualityToFfmpegQscale(options.quality ?? DEFAULT_QUALITY);
+  const outputWidth = options.outputWidth ?? DEFAULT_OUTPUT_WIDTH;
+  const outputHeight = options.outputHeight ?? DEFAULT_OUTPUT_HEIGHT;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   return new Promise((resolve, reject) => {
@@ -42,8 +66,10 @@ export function captureFrame(options: CaptureFrameOptions): Promise<Buffer> {
       `video=${options.deviceName}`,
       '-frames:v',
       '1',
+      '-vf',
+      `scale=${outputWidth}:${outputHeight}`,
       '-q:v',
-      String(quality),
+      String(qscale),
       '-f',
       'mjpeg',
       'pipe:1',

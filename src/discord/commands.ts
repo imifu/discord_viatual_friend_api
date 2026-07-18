@@ -8,13 +8,19 @@ import {
 import { createLogger } from '../utils/logger.js';
 import { AppError, NotInVoiceChannelError, toUserMessage } from '../utils/errors.js';
 import { joinChannel, leaveChannel, isConnected } from './voice-connection.js';
-import { getStatus } from '../state/bridge-state.js';
+import { getRuntime, getStatus } from '../state/bridge-state.js';
 import { loadConfig } from '../config/env.js';
 import { startRelay, stopRelay } from '../services/bridge-service.js';
 import { MAX_CLIP_SECONDS, saveRecentClip } from '../services/clip-service.js';
 import { captureFrame } from '../video/screen-capture.js';
 
 const logger = createLogger('commands');
+
+// Issue #19 (実機フィードバック): /capが起動する応答は、通常の会話用instructionsを変更せず
+// (session.updateの設定はそのまま)、response.createへその応答だけの上書きとして渡す。実機で
+// 無制限応答が約30秒に達し音声出力コストが大きかったため、1文・短時間に制限する。
+const SCREEN_CAP_REACTION_INSTRUCTIONS =
+  '画面を見た自然な実況または感想を、日本語で1文だけ返してください。30〜50文字程度とし、画面要素を列挙した長い説明はしないでください。';
 
 export const commandDefinitions = [
   new SlashCommandBuilder().setName('join').setDescription('あなたが参加しているボイスチャンネルにBotを参加させます'),
@@ -40,7 +46,7 @@ export const commandDefinitions = [
     .setDescription('現在Realtimeセッションに設定されている性格プロンプト(instructions)を表示します'),
   new SlashCommandBuilder()
     .setName('cap')
-    .setDescription('OBS仮想カメラから1枚キャプチャしてこのチャンネルへ投稿します(検証用。Realtime APIへは送信しません)')
+    .setDescription('今見えてる光景はこんなかんじ！')
     // 実行者は引き続きサーバー管理権限を持つメンバーに限定する(Bot動作PCの画面を誰でも
     // キャプチャできてしまわないようにするため)。結果はチャンネルへ公開投稿されるため、
     // 実行できる人を絞ることが唯一の安全弁になる(サーバーの「統合」設定から上書き可能)。
@@ -135,12 +141,60 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   // (ephemeralにはしない)。実行者をManageGuild権限保持者に限定していることが、
   // Bot動作PCの画面(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を守る唯一の制御になる。
   await interaction.deferReply();
+  const guildId = interaction.guildId!;
   const { video } = loadConfig();
   const jpeg = await captureFrame({ deviceName: video.captureDevice });
+
+  // Issue #19 (Issue #6 Step 2、実機レビュー対応): 画像はキャプチャでき次第すぐ投稿する。
+  // appendImage()/requestResponseWhenIdle()のAPI確認(最大数秒)を待ってから投稿すると、その分
+  // 画像の表示自体が遅れてしまう(Codexレビューで指摘)ため、Discordへの返信とRealtime APIへの
+  // 送信確認を切り離した。
+  const session = getRuntime(guildId).realtimeSession;
+  const content = session
+    ? '今見えてる光景を送るよ！こんなかんじです！(AIにも送ったよ)'
+    : '今見えてる光景を送るよ！こんなかんじです！(/startしてないから、AIにはまだ送ってないよ)';
   await interaction.editReply({
-    content: `OBS仮想カメラ(device="${video.captureDevice}")から取得した画像です(検証用。Realtime APIへは送信していません)。`,
+    content,
     files: [{ attachment: jpeg, name: 'cap.jpg' }],
   });
+  if (!session) return;
+
+  // 画像追加とresponse.create(発話終了まで自動的に遅延・複数回のcoalesceも行う)は、
+  // 互いのAPI確認を待たずに直後に呼ぶ。WebSocketは1本の接続で送信順が保たれるため、
+  // conversation.item.create → response.createの順序はappendImage()の確認を待たなくても
+  // 保証される。await appendImage()してからrequestResponseWhenIdle()を呼ぶ形だと、その間に
+  // 発話終了のタイミングを逃してcoalesceが効かず、応答が2回に分かれる不具合があった
+  // (Codexレビューで発覚)。
+  const appendOutcome = session.appendImage(jpeg, video.captureDetail);
+  // accepted: response.createが受理され開始したことの確認。completed: その応答が実際に
+  // 完了(または途中終了)したことの確認。response.createdの受理確認だけでは、その後failed/
+  // incompleteになった場合を見落とすため、response.doneのstatusまで見て区別する
+  // (Codexレビューで指摘)。
+  const { accepted, completed } = session.requestResponseWhenIdle({
+    instructions: SCREEN_CAP_REACTION_INSTRUCTIONS,
+    maxOutputTokens: video.reactionMaxOutputTokens,
+  });
+
+  // いずれかの失敗を検知した場合のみフォローアップで訂正する(成功時は音声応答そのものが
+  // 確認になるため、追加のメッセージは送らない)。1つの根本原因につき通知は1件だけにする:
+  // acceptedが失敗した場合、requestResponse()内部でcompletedも連動して同じ理由でrejectされる
+  // ため、両方に個別のcatchを付けると同じ失敗に対して2件のフォローアップが投稿されてしまう
+  // (Codexレビューで発覚)。completedのcatchは、acceptedが成功した場合にだけ登録する。
+  void appendOutcome.catch((err: unknown) => {
+    logger.warn(`/cap: 画像追加がAPI側で拒否されました: guild=${guildId}`, err);
+    void interaction.followUp('さっき送った画像、AIには届かなかったみたい…ごめんね').catch(() => undefined);
+  });
+  void accepted.then(
+    () =>
+      completed.catch((err: unknown) => {
+        logger.warn(`/cap: 応答の生成が失敗しました: guild=${guildId}`, err);
+        void interaction.followUp('さっき送った画像への反応が途中で失敗しちゃったみたい…ごめんね').catch(() => undefined);
+      }),
+    (err: unknown) => {
+      logger.warn(`/cap: 応答要求がAPI側で拒否されました: guild=${guildId}`, err);
+      void interaction.followUp('さっき送った画像、反応できなかったみたい…ごめんね').catch(() => undefined);
+    },
+  );
 }
 
 async function handleAirPrompt(interaction: ChatInputCommandInteraction): Promise<void> {
