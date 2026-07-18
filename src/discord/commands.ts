@@ -142,14 +142,21 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   // Issue #19 (Issue #6 Step 2): 中継中(/start済み)ならRealtime APIへも送信し、AIに即座に
   // 反応させる。中継していなければ従来通り画像を投稿するだけで、API利用料金は発生しない。
   // Realtime APIは同時に1つの応答しか受け付けないため、AI発話中はrequestResponseWhenIdle()が
-  // 応答要求を発話終了まで自動的に遅らせる(Codexレビュー: 発話中でも即座に反応するかのように
-  // 表示していた問題への対応)。
+  // 応答要求を発話終了まで自動的に遅らせ、複数回連続で実行しても1件にまとめる(Codexレビュー対応)。
+  // appendImage()はevent_idを使い、画像追加がAPI側で拒否された場合はここでエラーとして検知する
+  // (Codexレビュー対応: 拒否されていても成功表示していた問題)。ただし遅延させたresponse.create
+  // 自体の成否までは追跡しない(fire-and-forgetのまま、既知の制約としてREADMEに明記)。
   const session = getRuntime(guildId).realtimeSession;
   let content = '今見えてる光景を送るよ！こんなかんじです！';
   if (session) {
-    session.appendImage(jpeg, video.captureDetail);
-    const respondedImmediately = session.requestResponseWhenIdle();
-    content += respondedImmediately ? '(AIにも送ったよ、反応するね！)' : '(AIにも送ったよ、今の発話が終わったら反応するね！)';
+    try {
+      await session.appendImage(jpeg, video.captureDetail);
+      const respondedImmediately = session.requestResponseWhenIdle();
+      content += respondedImmediately ? '(AIにも送ったよ、反応するね！)' : '(AIにも送ったよ、今の発話が終わったら反応するね！)';
+    } catch (err) {
+      logger.warn(`/cap: 画像のRealtime API送信がAPI側で拒否されました: guild=${guildId}`, err);
+      content += '(AIへの送信は失敗しちゃった…画像だけ見てね)';
+    }
   } else {
     content += '(/startしてないから、AIにはまだ送ってないよ)';
   }

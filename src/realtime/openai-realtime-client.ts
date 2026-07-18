@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 import { OpenAIRealtimeWS } from 'openai/realtime/ws';
 import { createLogger } from '../utils/logger.js';
@@ -14,6 +15,11 @@ export const REALTIME_CHANNELS = 1;
 export type RealtimeImageDetail = 'low' | 'high' | 'auto';
 
 const CONNECT_TIMEOUT_MS = 10_000;
+// How long appendImage() waits for a correlated `error` event (matched by event_id) before
+// assuming the conversation.item.create was accepted. The API returns errors for rejected client
+// events promptly (validation/session-state failures), so this only needs to cover that
+// round-trip, not a full response cycle.
+const APPEND_IMAGE_CONFIRM_TIMEOUT_MS = 3000;
 
 interface RealtimeSessionEvents {
   /** 24kHz mono s16le PCM chunk decoded from a response.output_audio.delta event. */
@@ -73,6 +79,10 @@ function waitForSocketOpen(ws: OpenAIRealtimeWS): Promise<void> {
  */
 export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   private speaking = false;
+  /** Callbacks awaiting a possible `error` event correlated (by event_id) to a client event we sent. */
+  private readonly pendingEventErrors = new Map<string, (err: OpenAISessionError) => void>();
+  /** At most one pending "call requestResponse() once the model stops speaking" listener - see requestResponseWhenIdle(). */
+  private idleResponseListener?: (speaking: boolean) => void;
 
   private constructor(private readonly ws: OpenAIRealtimeWS) {
     super();
@@ -135,7 +145,16 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
 
     this.ws.on('error', (err) => {
       logger.error('Realtime APIでエラーが発生しました', err);
-      this.emit('error', new OpenAISessionError(err.message, err));
+      const sessionError = new OpenAISessionError(err.message, err);
+      const eventId = err.event_id;
+      if (eventId) {
+        const pending = this.pendingEventErrors.get(eventId);
+        if (pending) {
+          this.pendingEventErrors.delete(eventId);
+          pending(sessionError);
+        }
+      }
+      this.emit('error', sessionError);
     });
 
     this.ws.socket.on('close', () => {
@@ -160,17 +179,38 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     this.ws.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
   }
 
-  /** Adds a JPEG image as a user message item in the conversation. Does not by itself trigger a
-   *  response - pair with requestResponse() if an immediate reaction is wanted. */
-  appendImage(jpeg: Buffer, detail: RealtimeImageDetail): void {
+  /**
+   * Adds a JPEG image as a user message item in the conversation. Does not by itself trigger a
+   * response - pair with requestResponse()/requestResponseWhenIdle() if a reaction is wanted.
+   *
+   * Returns a promise that rejects if the API reports (via a `conversation.item.create`-error
+   * correlated by event_id) that the item was rejected within APPEND_IMAGE_CONFIRM_TIMEOUT_MS,
+   * and otherwise resolves once that window passes without an error. This only confirms the
+   * client event itself was accepted, not that any later response succeeds - see
+   * requestResponse()/requestResponseWhenIdle(), which remain fire-and-forget.
+   */
+  appendImage(jpeg: Buffer, detail: RealtimeImageDetail): Promise<void> {
+    const eventId = randomUUID();
+    const confirmed = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingEventErrors.delete(eventId);
+        resolve();
+      }, APPEND_IMAGE_CONFIRM_TIMEOUT_MS);
+      this.pendingEventErrors.set(eventId, (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
     this.ws.send({
       type: 'conversation.item.create',
+      event_id: eventId,
       item: {
         type: 'message',
         role: 'user',
         content: [{ type: 'input_image', image_url: `data:image/jpeg;base64,${jpeg.toString('base64')}`, detail }],
       },
     });
+    return confirmed;
   }
 
   /** Asks the model to generate a response now, independent of server-side VAD-triggered turns. */
@@ -190,21 +230,35 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       this.requestResponse();
       return true;
     }
-    // Use on()+manual removal rather than once(): once() would consume itself on the first
-    // speakingChanged event regardless of its value, so if that first event happened to fire
-    // with `true` (not expected from setSpeaking()'s own transition-only guard today, but this
-    // shouldn't depend on that), the deferred request would be silently dropped forever instead
-    // of still waiting for the eventual `false`.
-    const onSpeakingChanged = (speaking: boolean): void => {
-      if (speaking) return;
-      this.off('speakingChanged', onSpeakingChanged);
-      this.requestResponse();
-    };
-    this.on('speakingChanged', onSpeakingChanged);
+    // Coalesce: if a deferred request is already pending (e.g. /cap was run more than once while
+    // the model was mid-response), don't register a second listener. The Realtime API only
+    // accepts one active response at a time, so firing requestResponse() once per call the moment
+    // speakingChanged(false) arrives would send several response.create events back-to-back and
+    // all but the first would be rejected - one eventual response covering every image added in
+    // the meantime is both correct and cheaper.
+    if (!this.idleResponseListener) {
+      // Use on()+manual removal rather than once(): once() would consume itself on the first
+      // speakingChanged event regardless of its value, so if that first event happened to fire
+      // with `true` (not expected from setSpeaking()'s own transition-only guard today, but this
+      // shouldn't depend on that), the deferred request would be silently dropped forever instead
+      // of still waiting for the eventual `false`.
+      this.idleResponseListener = (speaking: boolean): void => {
+        if (speaking) return;
+        this.off('speakingChanged', this.idleResponseListener!);
+        this.idleResponseListener = undefined;
+        this.requestResponse();
+      };
+      this.on('speakingChanged', this.idleResponseListener);
+    }
     return false;
   }
 
   close(): void {
+    if (this.idleResponseListener) {
+      this.off('speakingChanged', this.idleResponseListener);
+      this.idleResponseListener = undefined;
+    }
+    this.pendingEventErrors.clear();
     this.ws.close();
   }
 }
