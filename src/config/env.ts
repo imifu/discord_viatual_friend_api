@@ -65,6 +65,15 @@ function optionalRangeFloat(name: string, fallback: number, min: number, max: nu
   return parsed;
 }
 
+function optionalOneOf<T extends string>(name: string, fallback: T, allowed: readonly T[]): T {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === '') return fallback;
+  if (!(allowed as readonly string[]).includes(raw)) {
+    throw new ConfigError(`環境変数 ${name} は${allowed.join('/')}のいずれかである必要があります (現在値: "${raw}")。`);
+  }
+  return raw as T;
+}
+
 export interface AppConfig {
   discord: {
     token: string;
@@ -100,6 +109,8 @@ export interface AppConfig {
   video: {
     /** Windows DirectShow device name for screen capture (OBS Virtual Camera by default). */
     captureDevice: string;
+    /** Realtime API image detail level sent with captured frames - 'low' keeps cost fixed/low. */
+    captureDetail: 'low' | 'high' | 'auto';
   };
 }
 
@@ -141,6 +152,7 @@ export function loadConfig(): AppConfig {
     },
     video: {
       captureDevice: optionalString('SCREEN_CAPTURE_DEVICE') ?? 'OBS Virtual Camera',
+      captureDetail: optionalOneOf('SCREEN_CAPTURE_DETAIL', 'low', ['low', 'high', 'auto'] as const),
     },
   };
 

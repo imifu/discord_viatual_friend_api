@@ -8,7 +8,7 @@ import {
 import { createLogger } from '../utils/logger.js';
 import { AppError, NotInVoiceChannelError, toUserMessage } from '../utils/errors.js';
 import { joinChannel, leaveChannel, isConnected } from './voice-connection.js';
-import { getStatus } from '../state/bridge-state.js';
+import { getRuntime, getStatus } from '../state/bridge-state.js';
 import { loadConfig } from '../config/env.js';
 import { startRelay, stopRelay } from '../services/bridge-service.js';
 import { MAX_CLIP_SECONDS, saveRecentClip } from '../services/clip-service.js';
@@ -40,7 +40,7 @@ export const commandDefinitions = [
     .setDescription('現在Realtimeセッションに設定されている性格プロンプト(instructions)を表示します'),
   new SlashCommandBuilder()
     .setName('cap')
-    .setDescription('OBS仮想カメラから1枚キャプチャしてこのチャンネルへ投稿します(検証用。Realtime APIへは送信しません)')
+    .setDescription('今見えてる光景はこんなかんじ！')
     // 実行者は引き続きサーバー管理権限を持つメンバーに限定する(Bot動作PCの画面を誰でも
     // キャプチャできてしまわないようにするため)。結果はチャンネルへ公開投稿されるため、
     // 実行できる人を絞ることが唯一の安全弁になる(サーバーの「統合」設定から上書き可能)。
@@ -135,10 +135,24 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   // (ephemeralにはしない)。実行者をManageGuild権限保持者に限定していることが、
   // Bot動作PCの画面(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を守る唯一の制御になる。
   await interaction.deferReply();
+  const guildId = interaction.guildId!;
   const { video } = loadConfig();
   const jpeg = await captureFrame({ deviceName: video.captureDevice });
+
+  // Issue #19 (Issue #6 Step 2): 中継中(/start済み)ならRealtime APIへも送信し、AIに即座に
+  // 反応させる。中継していなければ従来通り画像を投稿するだけで、API利用料金は発生しない。
+  const session = getRuntime(guildId).realtimeSession;
+  let content = '今見えてる光景を送るよ！こんなかんじです！';
+  if (session) {
+    session.appendImage(jpeg, video.captureDetail);
+    session.requestResponse();
+    content += '(AIにも送ったよ、反応するね！)';
+  } else {
+    content += '(/startしてないから、AIにはまだ送ってないよ)';
+  }
+
   await interaction.editReply({
-    content: `OBS仮想カメラ(device="${video.captureDevice}")から取得した画像です(検証用。Realtime APIへは送信していません)。`,
+    content,
     files: [{ attachment: jpeg, name: 'cap.jpg' }],
   });
 }

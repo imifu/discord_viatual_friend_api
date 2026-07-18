@@ -10,6 +10,9 @@ const logger = createLogger('openai-realtime');
 export const REALTIME_SAMPLE_RATE = 24000;
 export const REALTIME_CHANNELS = 1;
 
+/** Realtime API image input detail level - 'low' is a fixed low token cost regardless of resolution; 'high'/'auto' scale with resolution. */
+export type RealtimeImageDetail = 'low' | 'high' | 'auto';
+
 const CONNECT_TIMEOUT_MS = 10_000;
 
 interface RealtimeSessionEvents {
@@ -155,6 +158,24 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   appendAudio(pcm: Buffer): void {
     if (pcm.length === 0) return;
     this.ws.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+  }
+
+  /** Adds a JPEG image as a user message item in the conversation. Does not by itself trigger a
+   *  response - pair with requestResponse() if an immediate reaction is wanted. */
+  appendImage(jpeg: Buffer, detail: RealtimeImageDetail): void {
+    this.ws.send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_image', image_url: `data:image/jpeg;base64,${jpeg.toString('base64')}`, detail }],
+      },
+    });
+  }
+
+  /** Asks the model to generate a response now, independent of server-side VAD-triggered turns. */
+  requestResponse(): void {
+    this.ws.send({ type: 'response.create' });
   }
 
   close(): void {

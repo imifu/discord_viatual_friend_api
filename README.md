@@ -129,6 +129,7 @@ AIR_READING_ENABLED=true
 # AIR_READING_PROMPT=任意の上書きプロンプト（改行は\n）
 
 SCREEN_CAPTURE_DEVICE=OBS Virtual Camera
+SCREEN_CAPTURE_DETAIL=low
 ```
 
 `.env` は `.gitignore` 済みで、Git管理対象外です。
@@ -164,7 +165,14 @@ OpenAI公式の料金ページ([2026年7月時点](https://platform.openai.com/d
 
 ### 画面キャプチャ(検証中、[Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6))
 
-`/cap`は、`SCREEN_CAPTURE_DEVICE`(既定 `OBS Virtual Camera`)で指定したWindows DirectShowデバイスからffmpegで1枚だけ静止画をキャプチャし、実行したチャンネルへ画像として投稿する検証用コマンドです。**現時点ではRealtime APIへは一切送信しておらず、OpenAI利用料金に影響しません。** OBS仮想カメラ映像をAIとの会話コンテキストへ実際に送る機能はIssue #6の後続ステップとして別途実装予定で、送信頻度・画質(`detail`)・会話コンテキストへの蓄積方法はコストに直結するため、実装前にあらためて設定を確認します。
+`/cap`は、`SCREEN_CAPTURE_DEVICE`(既定 `OBS Virtual Camera`)で指定したWindows DirectShowデバイスからffmpegで1枚だけ静止画をキャプチャし、実行したチャンネルへ画像として投稿するコマンドです。
+
+- **中継(`/start`)を実行していない場合**: 画像を投稿するだけで、Realtime APIへは送信されません。OpenAI利用料金には一切影響しません。
+- **`/start`済みの場合**([Issue #19](https://github.com/imifu/discord_viatual_friend_api/issues/19)): 画像をRealtime APIの会話コンテキストへ`input_image`として送信し、続けてAIに応答を促します(`response.create`)。**このときAIが音声で応答するため、通常の音声出力コストが発生します。** 画像自体のコストは`SCREEN_CAPTURE_DETAIL`(既定 `low`、固定約85トークン相当)で低く抑えていますが、`/cap`を実行するたびに1回分の音声応答が発生する点に注意してください。
+- 送信した画像は会話コンテキストに残り続けます。長時間の中継で`/cap`を何度も実行するとコンテキストが肥大化し、以後の応答コストが増えていく可能性があります。この対策(古い画像の自動削除)は[Issue #20](https://github.com/imifu/discord_viatual_friend_api/issues/20)(Step 3)で対応予定です。
+- モデルが既に発話中に`/cap`を実行すると、`response.create`がAPI側でエラーになる場合があります(その場合は画像投稿自体は成功し、ログにRealtimeセッションのエラーが出るだけです)。
+
+`/start`中の自動定期キャプチャ・送信(ユーザー操作なしでAIが画面を見続ける機能)は未実装で、[Issue #20](https://github.com/imifu/discord_viatual_friend_api/issues/20)(Step 3)で対応予定です。
 
 **`/cap`の取得画像は、実行したチャンネルを閲覧できるサーバーメンバー全員に見える通常メッセージとして投稿されます(ephemeralではありません、[Issue #17](https://github.com/imifu/discord_viatual_friend_api/issues/17))。** OBS仮想カメラにはゲーム画面以外の通知・別ウィンドウ・個人情報などが映り込む可能性があるため、キャプチャ対象のウィンドウ・シーンをOBS側で事前に確認し、公開してよい内容だけを仮想カメラへ出力する運用にしてください。誰でも画面を取得できてしまわないよう、`/cap`は既定でサーバー管理権限(`ManageGuild`)を持つメンバーのみ実行できます。実行可能な範囲を変更したい場合は、サーバーの「統合」設定からコマンドごとの権限を上書きしてください。コマンド定義を変更したため、反映には `npm run register` の再実行が必要です。
 
@@ -235,7 +243,7 @@ npm start
 - 複数ギルドでの同時運用は想定していません(1プロセスにつき実運用は1サーバー・1VCを想定。内部的にはギルドID単位で状態を保持していますが、動作確認は単一ギルドのみです)
 - OpenAI Realtime APIの利用には課金が発生します。料金体系はOpenAIの公式ドキュメントを参照してください
 - 「投稿して」音声トリガーによるテキスト投稿機能、会話ログの自動文字起こし機能は、旧バージョン(ローカルWhisper依存)からの移行中のため一時的に利用できません(復活作業は別途進行中)
-- `/cap`によるOBS仮想カメラのキャプチャは検証用コマンドのみ実装済みで、Realtime APIへの自動送信・AIによる画面内容を踏まえた応答は未実装です([Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6)、継続対応中)。取得画像は実行チャンネルへ公開投稿されます([Issue #17](https://github.com/imifu/discord_viatual_friend_api/issues/17))
+- `/cap`は`/start`中はRealtime APIへ画像を送信しAIが音声で応答しますが([Issue #19](https://github.com/imifu/discord_viatual_friend_api/issues/19))、手動トリガーのみです。`/start`中の自動定期キャプチャ・送信は未実装です([Issue #20](https://github.com/imifu/discord_viatual_friend_api/issues/20)、継続対応中)。送信した画像は会話コンテキストに残り続け、古い画像の自動削除も未実装です(同Issue)。取得画像は実行チャンネルへ公開投稿されます([Issue #17](https://github.com/imifu/discord_viatual_friend_api/issues/17))
 - `Ctrl+C`(SIGINT)による終了処理は自動テストできておらず、動作確認は開発者による手動実施のみです(下記テスト手順参照)
 
 ---
@@ -274,3 +282,4 @@ npm start
 | 26 | 画面キャプチャ失敗時のエラー | OBS仮想カメラを起動していない状態、またはffmpeg未インストール/PATH未設定の状態で`/cap` | 「画面キャプチャに失敗しました」エラーが返る |
 | 27 | 画面キャプチャの権限制限 | サーバー管理権限を持たないメンバーが`/cap`を実行しようとする | Discord側でコマンド自体が表示されない、または実行できない(既定メンバー権限`ManageGuild`により制限)。旧`/screencap`も表示・実行できない |
 | 28 | 画面キャプチャの同時実行制御 | `/cap`実行中(応答が返る前)にもう一度`/cap`を実行する | 2回目は「別の画面キャプチャが進行中です」エラーが返り、ffmpegプロセスが二重起動しない |
+| 29 | 画面キャプチャのRealtime API送信(Issue #19) | `/start`後に`/cap`を実行する | 画像がチャンネルへ投稿され(「AIにも送ったよ」等の文言)、続けてAIが画面内容を踏まえた音声で応答する。`/start`前に`/cap`した場合は画像投稿のみで音声応答は起きないことも合わせて確認する |
