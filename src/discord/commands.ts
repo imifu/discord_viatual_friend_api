@@ -2,6 +2,7 @@ import {
   ChatInputCommandInteraction,
   GuildMember,
   MessageFlags,
+  PermissionFlagsBits,
   SlashCommandBuilder,
 } from 'discord.js';
 import { createLogger } from '../utils/logger.js';
@@ -11,6 +12,7 @@ import { getStatus } from '../state/bridge-state.js';
 import { loadConfig } from '../config/env.js';
 import { startRelay, stopRelay } from '../services/bridge-service.js';
 import { MAX_CLIP_SECONDS, saveRecentClip } from '../services/clip-service.js';
+import { captureFrame } from '../video/screen-capture.js';
 
 const logger = createLogger('commands');
 
@@ -36,6 +38,12 @@ export const commandDefinitions = [
   new SlashCommandBuilder()
     .setName('airprompt')
     .setDescription('現在Realtimeセッションに設定されている性格プロンプト(instructions)を表示します'),
+  new SlashCommandBuilder()
+    .setName('screencap')
+    .setDescription('OBS仮想カメラから1枚キャプチャして画像として返します(検証用。Realtime APIへは送信しません)')
+    // Bot動作PCの画面(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を誰でも閲覧できてしまわないよう、
+    // 既定ではサーバー管理権限を持つメンバーのみに制限する(サーバーの「統合」設定から上書き可能)。
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((builder) => builder.toJSON());
 
 type Handler = (interaction: ChatInputCommandInteraction) => Promise<void>;
@@ -121,6 +129,18 @@ async function handleClip(interaction: ChatInputCommandInteraction): Promise<voi
   });
 }
 
+async function handleScreenCap(interaction: ChatInputCommandInteraction): Promise<void> {
+  // 検証用コマンドであり、Bot動作PCの画面内容(ゲーム画面以外を含みうる)を返すため、
+  // 実行したメンバー以外には見えないephemeral応答にする。
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const { video } = loadConfig();
+  const jpeg = await captureFrame({ deviceName: video.captureDevice });
+  await interaction.editReply({
+    content: `OBS仮想カメラ(device="${video.captureDevice}")から取得した画像です(検証用。Realtime APIへは送信していません)。`,
+    files: [{ attachment: jpeg, name: 'screencap.jpg' }],
+  });
+}
+
 async function handleAirPrompt(interaction: ChatInputCommandInteraction): Promise<void> {
   const { airReading } = loadConfig();
   const content = airReading.enabled
@@ -138,6 +158,7 @@ const handlers: Record<string, Handler> = {
   status: handleStatus,
   clip: handleClip,
   airprompt: handleAirPrompt,
+  screencap: handleScreenCap,
 };
 
 export async function dispatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
