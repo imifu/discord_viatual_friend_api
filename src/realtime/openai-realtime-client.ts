@@ -44,6 +44,28 @@ export interface RealtimeSessionOptions {
   speed: number;
 }
 
+interface Settlers {
+  resolve: () => void;
+  reject: (err: OpenAISessionError) => void;
+}
+
+interface PendingIdleResponse {
+  overrides?: { instructions?: string; maxOutputTokens?: number };
+  listener: (speaking: boolean) => void;
+  accepted: Settlers & { promise: Promise<void> };
+  completed: Settlers & { promise: Promise<void> };
+}
+
+function deferred(): Settlers & { promise: Promise<void> } {
+  let resolve!: () => void;
+  let reject!: (err: OpenAISessionError) => void;
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function waitForSocketOpen(ws: OpenAIRealtimeWS): Promise<void> {
   return new Promise((resolve, reject) => {
     const socket = ws.socket;
@@ -81,25 +103,22 @@ function waitForSocketOpen(ws: OpenAIRealtimeWS): Promise<void> {
  */
 export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   private speaking = false;
-  /** True from the moment requestResponse() sends response.create until its confirmation settles
-   *  (response.created / a correlated error / POSITIVE_CONFIRM_TIMEOUT_MS) - covers the brief gap
-   *  right after sending where `speaking` doesn't reflect it yet, so two requestResponseWhenIdle()
-   *  calls made back-to-back before the first is confirmed can't both see "not busy" and both send
-   *  response.create (the API only allows one active response at a time). */
+  /** True from the moment requestResponse() sends response.create until its accepted-confirmation
+   *  settles - covers the brief gap right after sending where `speaking` doesn't reflect it yet,
+   *  so two requestResponseWhenIdle() calls made back-to-back before the first is confirmed can't
+   *  both see "not busy" and both send response.create (the API only allows one active response
+   *  at a time). */
   private responsePending = false;
-  /** Resolve/reject pairs awaiting a positive confirmation (conversation.item.created / response.
-   *  created) or a correlated `error`, keyed by an id we generate ourselves and attach as both the
-   *  client event's event_id (for error correlation) and either the item's id or the response's
-   *  metadata.requestId (for positive confirmation - see appendImage()/requestResponse()). */
-  private readonly pendingConfirmations = new Map<string, { resolve: () => void; reject: (err: OpenAISessionError) => void }>();
-  /** At most one pending "call requestResponse() once no response is busy" listener - see requestResponseWhenIdle()/tryDispatchIdleResponse(). */
-  private idleResponseListener?: (speaking: boolean) => void;
-  /** overrides/resolve/reject for the currently-pending deferred request, so tryDispatchIdleResponse() can fire or cancel it from more than one trigger (see below): a normal speakingChanged(false), or the earlier response that was blocking us failing/timing out before it ever started speaking. */
-  private idleResponseOverrides?: { instructions?: string; maxOutputTokens?: number };
-  private idleResponseResolve?: () => void;
-  private idleResponseReject?: (err: OpenAISessionError) => void;
-  /** The shared outcome promise every caller coalesced into the current pending deferred request receives. */
-  private idleResponseOutcome?: Promise<void>;
+  /** Resolve/reject pairs awaiting a positive "accepted" confirmation (conversation.item.created /
+   *  response.created) or a correlated `error`, keyed by an id we generate ourselves and attach as
+   *  both the client event's event_id (for error correlation) and either the item's id or the
+   *  response's metadata.requestId (for positive confirmation - see appendImage()/requestResponse()). */
+  private readonly pendingConfirmations = new Map<string, Settlers>();
+  /** Resolve/reject pairs awaiting a response's *final* outcome (response.done's status), keyed by
+   *  the same request id used for the "accepted" confirmation above - see requestResponse(). */
+  private readonly pendingCompletions = new Map<string, Settlers>();
+  /** At most one pending "call requestResponse() once no response is busy" request - see requestResponseWhenIdle()/tryDispatchIdleResponse(). */
+  private idlePending?: PendingIdleResponse;
 
   private constructor(private readonly ws: OpenAIRealtimeWS) {
     super();
@@ -162,13 +181,32 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
 
     this.ws.on('response.created', (event) => {
       this.setSpeaking(true);
-      // Positive confirmation for requestResponse(): resolves the pending confirmation whose id
-      // we attached as response.metadata.requestId when we sent response.create. Responses
+      // Positive confirmation for requestResponse(): resolves the "accepted" confirmation whose
+      // id we attached as response.metadata.requestId when we sent response.create. Responses
       // auto-created by server-side VAD (not through requestResponse()) won't carry this
       // metadata, so this is a no-op for those.
       this.resolvePendingConfirmation(event.response.metadata?.requestId);
     });
-    this.ws.on('response.done', () => this.setSpeaking(false));
+
+    this.ws.on('response.done', (event) => {
+      this.setSpeaking(false);
+      const requestId = event.response.metadata?.requestId;
+      if (!requestId) return;
+      const pending = this.pendingCompletions.get(requestId);
+      if (!pending) return;
+      this.pendingCompletions.delete(requestId);
+      // `completed`/`incomplete` (e.g. hit our own max_output_tokens cap)/`cancelled` (e.g. the
+      // user's own barge-in interrupted it) all mean *some* real spoken output was very likely
+      // already produced - only `failed` represents a genuine silent failure worth telling the
+      // user about (Codexレビューで指摘: response.createdの受理確認だけでは、その後failed/
+      // incompleteになった場合を見落としていた).
+      if (event.response.status === 'failed') {
+        const detail = event.response.status_details?.error;
+        pending.reject(new OpenAISessionError(detail ? `応答が失敗しました: ${JSON.stringify(detail)}` : '応答が失敗しました'));
+      } else {
+        pending.resolve();
+      }
+    });
 
     this.ws.on('input_audio_buffer.speech_started', () => this.emit('userSpeechStarted'));
     this.ws.on('input_audio_buffer.speech_stopped', () => this.emit('userSpeechStopped'));
@@ -182,7 +220,9 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       // the client event that caused the error"). Using err.event_id here would never match
       // anything we track, silently defeating appendImage()/requestResponse()'s rejection
       // detection (Codexレビューで発覚: 確認機構が常にtimeout経由でresolveしていた).
-      this.rejectPendingConfirmation(err.error?.event_id, sessionError);
+      const eventId = err.error?.event_id;
+      this.rejectPendingConfirmation(eventId, sessionError);
+      this.rejectPendingCompletion(eventId, sessionError);
       this.emit('error', sessionError);
     });
 
@@ -213,48 +253,50 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     pending.reject(err);
   }
 
-  /** Clears all deferred-idle-response bookkeeping without settling anything - used once we're
-   *  about to either dispatch or reject it, so a later trigger can't act on stale state. */
-  private clearIdleResponseState(): void {
-    if (this.idleResponseListener) {
-      this.off('speakingChanged', this.idleResponseListener);
-      this.idleResponseListener = undefined;
-    }
-    this.idleResponseOverrides = undefined;
-    this.idleResponseResolve = undefined;
-    this.idleResponseReject = undefined;
-    this.idleResponseOutcome = undefined;
+  private rejectPendingCompletion(id: string | undefined | null, err: OpenAISessionError): void {
+    if (!id) return;
+    const pending = this.pendingCompletions.get(id);
+    if (!pending) return;
+    this.pendingCompletions.delete(id);
+    pending.reject(err);
   }
 
   /**
    * If a deferred requestResponseWhenIdle() call is waiting and no response is currently busy,
    * dispatch it now. Called from two places: a normal speakingChanged(false) (the response that
-   * was blocking us finished normally), and requestResponse()'s own confirmation settling (the
-   * response that was blocking us instead failed or timed out before ever starting - in that
-   * case speakingChanged(false) will never fire for it, so without this second call site a
+   * was blocking us finished normally), and requestResponse()'s own "accepted" confirmation
+   * settling (the response that was blocking us instead failed or timed out before ever starting -
+   * in that case speakingChanged(false) will never fire for it, so without this second call site a
    * waiting caller's outcome would never settle - Codexレビューで発覚).
    */
   private tryDispatchIdleResponse(): void {
-    if (!this.idleResponseListener || this.responseBusy) return;
-    const overrides = this.idleResponseOverrides;
-    const resolve = this.idleResponseResolve!;
-    const reject = this.idleResponseReject!;
-    this.clearIdleResponseState();
-    this.requestResponse(overrides).then(resolve, reject);
+    if (!this.idlePending || this.responseBusy) return;
+    const pending = this.idlePending;
+    this.off('speakingChanged', pending.listener);
+    this.idlePending = undefined;
+    const { accepted, completed } = this.requestResponse(pending.overrides);
+    accepted.then(pending.accepted.resolve, pending.accepted.reject);
+    completed.then(pending.completed.resolve, pending.completed.reject);
   }
 
   /** Shared cleanup for both close() and an unexpected socket disconnect: rejects every pending
    *  appendImage()/requestResponse() confirmation and any pending deferred idle-response request. */
   private rejectAllPending(reason: OpenAISessionError): void {
-    if (this.idleResponseReject) {
-      const reject = this.idleResponseReject;
-      this.clearIdleResponseState();
-      reject(reason);
+    if (this.idlePending) {
+      const pending = this.idlePending;
+      this.off('speakingChanged', pending.listener);
+      this.idlePending = undefined;
+      pending.accepted.reject(reason);
+      pending.completed.reject(reason);
     }
     for (const pending of this.pendingConfirmations.values()) {
       pending.reject(reason);
     }
     this.pendingConfirmations.clear();
+    for (const pending of this.pendingCompletions.values()) {
+      pending.reject(reason);
+    }
+    this.pendingCompletions.clear();
     this.responsePending = false;
   }
 
@@ -272,6 +314,14 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   appendAudio(pcm: Buffer): void {
     if (pcm.length === 0) return;
     this.ws.send({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') });
+  }
+
+  /** Generates an id for correlating our own client events with the API's confirmation events.
+   *  Deliberately shorter than a raw UUID (36 chars): the Realtime API rejects `item.id` values
+   *  over 32 characters (confirmed on real traffic - a raw randomUUID() broke every /cap while
+   *  connected). Stripping the hyphens from a UUID gives exactly 32 hex characters. */
+  private generateId(): string {
+    return randomUUID().replace(/-/g, '');
   }
 
   /** Tracks id, resolving on a positive confirmation (conversation.item.created / response.created
@@ -304,7 +354,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
    * awaitConfirmed()).
    */
   appendImage(jpeg: Buffer, detail: RealtimeImageDetail): Promise<void> {
-    const itemId = randomUUID();
+    const itemId = this.generateId();
     const confirmed = this.awaitConfirmed(itemId, POSITIVE_CONFIRM_TIMEOUT_MS);
     this.ws.send({
       type: 'conversation.item.create',
@@ -322,20 +372,28 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   /**
    * Sends response.create now, independent of server-side VAD-triggered turns. `overrides` lets
    * callers replace this one response's instructions/max_output_tokens without touching the
-   * session's persistent config (e.g. to keep an image reaction short). Returns a promise that
-   * resolves once the API confirms the response actually started (response.created) and rejects
-   * on a correlated error or on timeout (see awaitConfirmed()).
+   * session's persistent config (e.g. to keep an image reaction short).
+   *
+   * Returns two promises tracking two different milestones:
+   * - `accepted` resolves once the API confirms the response actually started (response.created)
+   *   and rejects on a correlated error or on timeout (see awaitConfirmed()).
+   * - `completed` resolves once that response finishes with a real (if possibly truncated or
+   *   interrupted) result - `completed`/`incomplete`/`cancelled` - and rejects only on a genuine
+   *   `failed` status or if `accepted` itself never resolved. This is the signal to use for
+   *   "did the user actually get a reaction", since `accepted` alone only proves the response
+   *   object was created, not that it produced anything (Codexレビューで指摘).
    */
-  requestResponse(overrides?: { instructions?: string; maxOutputTokens?: number }): Promise<void> {
-    const requestId = randomUUID();
+  requestResponse(overrides?: { instructions?: string; maxOutputTokens?: number }): { accepted: Promise<void>; completed: Promise<void> } {
+    const requestId = this.generateId();
     this.responsePending = true;
-    const confirmed = this.awaitConfirmed(requestId, POSITIVE_CONFIRM_TIMEOUT_MS);
-    // .finally() returns a *new* promise that also rejects if `confirmed` does - without the
+
+    const accepted = this.awaitConfirmed(requestId, POSITIVE_CONFIRM_TIMEOUT_MS);
+    // .finally() returns a *new* promise that also rejects if `accepted` does - without the
     // trailing .catch(() => {}), that derived promise would be an unhandled rejection whenever a
-    // response request fails, independent of whatever the caller does with the `confirmed`
-    // promise this method returns (a real bug caught while writing this method's own tests: it
-    // crashed the process under Node's default unhandled-rejection handling).
-    void confirmed
+    // response request fails, independent of whatever the caller does with `accepted` itself (a
+    // real bug caught while testing this method: it crashed the process under Node's default
+    // unhandled-rejection handling).
+    void accepted
       .finally(() => {
         this.responsePending = false;
         // Whether this settled by success (now speaking, so responseBusy stays true via
@@ -346,6 +404,12 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       })
       .catch(() => {});
 
+    const completedSettlers = deferred();
+    accepted.then(
+      () => this.pendingCompletions.set(requestId, completedSettlers),
+      (err: OpenAISessionError) => completedSettlers.reject(err),
+    );
+
     this.ws.send({
       type: 'response.create',
       event_id: requestId,
@@ -355,7 +419,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
         ...(overrides?.maxOutputTokens !== undefined && { max_output_tokens: overrides.maxOutputTokens }),
       },
     });
-    return confirmed;
+    return { accepted, completed: completedSettlers.promise };
   }
 
   /** Whether a response.create is either confirmed active (speaking) or was just sent and hasn't
@@ -369,18 +433,19 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
    * already in flight (the Realtime API only allows one active response per conversation at a
    * time): if the model is currently speaking, waits for the in-flight response to finish
    * (speakingChanged(false)) before sending response.create. `respondedImmediately` tells callers
-   * whether the request was sent right away or deferred, for accurate user-facing feedback;
-   * `outcome` resolves/rejects per requestResponse()'s contract once the (possibly deferred)
-   * request is actually sent - callers that can't block on it (the deferred case usually can't,
-   * since they've likely already replied to the user) should attach a rejection handler to correct
-   * any earlier "it worked" message instead of awaiting it inline.
+   * whether the request was sent right away or deferred, for accurate user-facing feedback.
+   * `accepted`/`completed` behave as documented on requestResponse(), once the (possibly
+   * deferred) request is actually sent - callers that can't block on them (the deferred case
+   * usually can't, since they've likely already replied to the user) should attach rejection
+   * handlers to correct any earlier "it worked" message instead of awaiting them inline.
    */
   requestResponseWhenIdle(overrides?: {
     instructions?: string;
     maxOutputTokens?: number;
-  }): { respondedImmediately: boolean; outcome: Promise<void> } {
+  }): { respondedImmediately: boolean; accepted: Promise<void>; completed: Promise<void> } {
     if (!this.responseBusy) {
-      return { respondedImmediately: true, outcome: this.requestResponse(overrides) };
+      const { accepted, completed } = this.requestResponse(overrides);
+      return { respondedImmediately: true, accepted, completed };
     }
     // Coalesce: if a deferred request is already pending (e.g. /cap was run more than once while
     // the model was mid-response), don't register a second listener. The Realtime API only
@@ -389,32 +454,30 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     // all but the first would be rejected - one eventual response covering every image added in
     // the meantime is both correct and cheaper. The overrides passed on this first (coalescing)
     // call win; later calls while still waiting just join the same pending request and share its
-    // outcome promise. Note: this only coalesces requests that arrive before this deferred one is
-    // dispatched - once dispatched, a later /cap starts a new coalescing window and gets its own
-    // separate response, since an already-started response can't retroactively include a new
-    // image (see README "画面キャプチャ" for the user-facing explanation).
-    if (!this.idleResponseListener || !this.idleResponseOutcome) {
-      this.idleResponseOverrides = overrides;
-      this.idleResponseOutcome = new Promise<void>((resolve, reject) => {
-        this.idleResponseResolve = resolve;
-        this.idleResponseReject = reject;
-        // Use on()+manual removal rather than once(): once() would consume itself on the first
-        // speakingChanged event regardless of its value, so if that first event happened to fire
-        // with `true` (not expected from setSpeaking()'s own transition-only guard today, but
-        // this shouldn't depend on that), the deferred request would be silently dropped forever
-        // instead of still waiting for the eventual `false`. tryDispatchIdleResponse() is also
-        // called from requestResponse()'s own confirmation-settling path (see there) - not just
-        // this listener - to cover the case where the response we're waiting behind fails/times
-        // out before ever actually starting to speak, since speakingChanged(false) would never
-        // fire for that.
-        this.idleResponseListener = (speaking: boolean): void => {
-          if (speaking) return;
-          this.tryDispatchIdleResponse();
-        };
-        this.on('speakingChanged', this.idleResponseListener);
-      });
+    // accepted/completed promises. Note: this only coalesces requests that arrive before this
+    // deferred one is dispatched - once dispatched, a later /cap starts a new coalescing window
+    // and gets its own separate response, since an already-started response can't retroactively
+    // include a new image (see README "画面キャプチャ" for the user-facing explanation).
+    if (!this.idlePending) {
+      const accepted = deferred();
+      const completed = deferred();
+      const listener = (speaking: boolean): void => {
+        if (speaking) return;
+        this.tryDispatchIdleResponse();
+      };
+      // Use on()+manual removal rather than once(): once() would consume itself on the first
+      // speakingChanged event regardless of its value, so if that first event happened to fire
+      // with `true` (not expected from setSpeaking()'s own transition-only guard today, but this
+      // shouldn't depend on that), the deferred request would be silently dropped forever instead
+      // of still waiting for the eventual `false`. tryDispatchIdleResponse() is also called from
+      // requestResponse()'s own "accepted" confirmation-settling path (see there) - not just this
+      // listener - to cover the case where the response we're waiting behind fails/times out
+      // before ever actually starting to speak, since speakingChanged(false) would never fire
+      // for that.
+      this.on('speakingChanged', listener);
+      this.idlePending = { overrides, listener, accepted, completed };
     }
-    return { respondedImmediately: false, outcome: this.idleResponseOutcome };
+    return { respondedImmediately: false, accepted: this.idlePending.accepted.promise, completed: this.idlePending.completed.promise };
   }
 
   close(): void {

@@ -166,20 +166,28 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   // 発話終了のタイミングを逃してcoalesceが効かず、応答が2回に分かれる不具合があった
   // (Codexレビューで発覚)。
   const appendOutcome = session.appendImage(jpeg, video.captureDetail);
-  const { outcome: responseOutcome } = session.requestResponseWhenIdle({
+  // accepted: response.createが受理され開始したことの確認。completed: その応答が実際に
+  // 完了(または途中終了)したことの確認。response.createdの受理確認だけでは、その後failed/
+  // incompleteになった場合を見落とすため、response.doneのstatusまで見て区別する
+  // (Codexレビューで指摘)。
+  const { accepted, completed } = session.requestResponseWhenIdle({
     instructions: SCREEN_CAP_REACTION_INSTRUCTIONS,
     maxOutputTokens: video.reactionMaxOutputTokens,
   });
 
-  // どちらも失敗を検知した場合のみフォローアップで訂正する(成功時は音声応答そのものが
+  // いずれかの失敗を検知した場合のみフォローアップで訂正する(成功時は音声応答そのものが
   // 確認になるため、追加のメッセージは送らない)。
   void appendOutcome.catch((err: unknown) => {
     logger.warn(`/cap: 画像追加がAPI側で拒否されました: guild=${guildId}`, err);
     void interaction.followUp('さっき送った画像、AIには届かなかったみたい…ごめんね').catch(() => undefined);
   });
-  void responseOutcome.catch((err: unknown) => {
+  void accepted.catch((err: unknown) => {
     logger.warn(`/cap: 応答要求がAPI側で拒否されました: guild=${guildId}`, err);
     void interaction.followUp('さっき送った画像、反応できなかったみたい…ごめんね').catch(() => undefined);
+  });
+  void completed.catch((err: unknown) => {
+    logger.warn(`/cap: 応答の生成が失敗しました: guild=${guildId}`, err);
+    void interaction.followUp('さっき送った画像への反応が途中で失敗しちゃったみたい…ごめんね').catch(() => undefined);
   });
 }
 
