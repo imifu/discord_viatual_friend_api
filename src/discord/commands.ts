@@ -16,6 +16,12 @@ import { captureFrame } from '../video/screen-capture.js';
 
 const logger = createLogger('commands');
 
+// Issue #19 (実機フィードバック): /capが起動する応答は、通常の会話用instructionsを変更せず
+// (session.updateの設定はそのまま)、response.createへその応答だけの上書きとして渡す。実機で
+// 無制限応答が約30秒に達し音声出力コストが大きかったため、1文・短時間に制限する。
+const SCREEN_CAP_REACTION_INSTRUCTIONS =
+  '画面を見た自然な実況または感想を、日本語で1文だけ返してください。30〜50文字程度とし、画面要素を列挙した長い説明はしないでください。';
+
 export const commandDefinitions = [
   new SlashCommandBuilder().setName('join').setDescription('あなたが参加しているボイスチャンネルにBotを参加させます'),
   new SlashCommandBuilder().setName('leave').setDescription('Botをボイスチャンネルから退出させます'),
@@ -151,7 +157,10 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   if (session) {
     try {
       await session.appendImage(jpeg, video.captureDetail);
-      const respondedImmediately = session.requestResponseWhenIdle();
+      const respondedImmediately = session.requestResponseWhenIdle({
+        instructions: SCREEN_CAP_REACTION_INSTRUCTIONS,
+        maxOutputTokens: video.reactionMaxOutputTokens,
+      });
       content += respondedImmediately ? '(AIにも送ったよ、反応するね！)' : '(AIにも送ったよ、今の発話が終わったら反応するね！)';
     } catch (err) {
       logger.warn(`/cap: 画像のRealtime API送信がAPI側で拒否されました: guild=${guildId}`, err);

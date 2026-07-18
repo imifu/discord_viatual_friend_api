@@ -213,9 +213,18 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     return confirmed;
   }
 
-  /** Asks the model to generate a response now, independent of server-side VAD-triggered turns. */
-  requestResponse(): void {
-    this.ws.send({ type: 'response.create' });
+  /** Per-response overrides for requestResponse()/requestResponseWhenIdle(), e.g. to keep an
+   *  image reaction short without touching the session's persistent instructions/voice config. */
+  requestResponse(overrides?: { instructions?: string; maxOutputTokens?: number }): void {
+    this.ws.send({
+      type: 'response.create',
+      ...(overrides && {
+        response: {
+          ...(overrides.instructions !== undefined && { instructions: overrides.instructions }),
+          ...(overrides.maxOutputTokens !== undefined && { max_output_tokens: overrides.maxOutputTokens }),
+        },
+      }),
+    });
   }
 
   /**
@@ -225,9 +234,9 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
    * (speakingChanged(false)) before sending response.create. Returns whether the request was
    * sent immediately (true) or deferred (false), so callers can give the user accurate feedback.
    */
-  requestResponseWhenIdle(): boolean {
+  requestResponseWhenIdle(overrides?: { instructions?: string; maxOutputTokens?: number }): boolean {
     if (!this.speaking) {
-      this.requestResponse();
+      this.requestResponse(overrides);
       return true;
     }
     // Coalesce: if a deferred request is already pending (e.g. /cap was run more than once while
@@ -235,7 +244,8 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     // accepts one active response at a time, so firing requestResponse() once per call the moment
     // speakingChanged(false) arrives would send several response.create events back-to-back and
     // all but the first would be rejected - one eventual response covering every image added in
-    // the meantime is both correct and cheaper.
+    // the meantime is both correct and cheaper. The overrides passed on this first (coalescing)
+    // call win; later calls while still waiting just join the same pending request.
     if (!this.idleResponseListener) {
       // Use on()+manual removal rather than once(): once() would consume itself on the first
       // speakingChanged event regardless of its value, so if that first event happened to fire
@@ -246,7 +256,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
         if (speaking) return;
         this.off('speakingChanged', this.idleResponseListener!);
         this.idleResponseListener = undefined;
-        this.requestResponse();
+        this.requestResponse(overrides);
       };
       this.on('speakingChanged', this.idleResponseListener);
     }

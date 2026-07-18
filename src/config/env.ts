@@ -65,6 +65,19 @@ function optionalRangeFloat(name: string, fallback: number, min: number, max: nu
   return parsed;
 }
 
+function optionalRangeInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed)) {
+    throw new ConfigError(`環境変数 ${name} は数値である必要があります (現在値: "${raw}")。`);
+  }
+  if (parsed < min || parsed > max) {
+    throw new ConfigError(`環境変数 ${name} は${min}以上${max}以下である必要があります (現在値: "${parsed}")。`);
+  }
+  return parsed;
+}
+
 function optionalOneOf<T extends string>(name: string, fallback: T, allowed: readonly T[]): T {
   const raw = process.env[name];
   if (!raw || raw.trim() === '') return fallback;
@@ -111,6 +124,8 @@ export interface AppConfig {
     captureDevice: string;
     /** Realtime API image detail level sent with captured frames - 'low' keeps cost fixed/low. */
     captureDetail: 'low' | 'high' | 'auto';
+    /** max_output_tokens for the response.create triggered by /cap, to keep image reactions short (real-device testing showed uncapped reactions running ~30s). */
+    reactionMaxOutputTokens: number;
   };
 }
 
@@ -153,6 +168,7 @@ export function loadConfig(): AppConfig {
     video: {
       captureDevice: optionalString('SCREEN_CAPTURE_DEVICE') ?? 'OBS Virtual Camera',
       captureDetail: optionalOneOf('SCREEN_CAPTURE_DETAIL', 'low', ['low', 'high', 'auto'] as const),
+      reactionMaxOutputTokens: optionalRangeInt('SCREEN_REACTION_MAX_OUTPUT_TOKENS', 120, 1, 4096),
     },
   };
 

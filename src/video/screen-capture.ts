@@ -1,16 +1,18 @@
 import { spawn } from 'node:child_process';
 import { ScreenCaptureBusyError, ScreenCaptureError } from '../utils/errors.js';
 
-// Capture design (fixed for now; see Issue #6 Step 1/2 discussion): OBS's Base Canvas is
-// 1920x1080, downscaled here to 960x540 before JPEG-encoding at ~quality 75, to keep the
-// base64-encoded payload and Realtime API image tokens small. A future periodic-capture mode
+// Capture design (fixed for now; see Issue #6 Step 1/2 discussion, tuned after real-device
+// testing): OBS's Base Canvas is 1920x1080, downscaled here to 640x360 before JPEG-encoding at
+// ~quality 65. Since SCREEN_CAPTURE_DETAIL defaults to 'low' (a fixed token cost regardless of
+// resolution), this downscale mainly reduces the base64 payload size, network transfer, and
+// send latency rather than Realtime API image-token cost. A future periodic-capture mode
 // (Issue #20 / Step 3) is intended to send at 1fps - not relevant to this single-shot capture,
 // but noted here since it uses the same encoding settings.
-const DEFAULT_OUTPUT_WIDTH = 960;
-const DEFAULT_OUTPUT_HEIGHT = 540;
+const DEFAULT_OUTPUT_WIDTH = 640;
+const DEFAULT_OUTPUT_HEIGHT = 360;
 // Standard 0-100 JPEG quality convention (higher = better), converted below to ffmpeg's mjpeg
 // -q:v scale (2-31, lower = better) - ffmpeg has no direct 0-100 quality flag for this encoder.
-const DEFAULT_QUALITY = 75;
+const DEFAULT_QUALITY = 65;
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 export interface CaptureFrameOptions {
