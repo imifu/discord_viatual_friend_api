@@ -99,9 +99,13 @@
 ## 6. Pull Request運用
 
 - 作業完了後、次の順で行う: テスト・検証 → コミット → Push → Pull Request作成。**マージはしない。**
-- **PR本文の冒頭には必ず `## FROM：Claude Code` と明記する(全角コロン、指定文字列をそのまま使用)。**
+- **PR本文の冒頭、およびPRへ投稿するレビュー関連コメント(Codexレビューへの対応・再レビュー依頼等)の冒頭には、
+  必ず `### FROM：Claude` と明記する(全角コロン、指定文字列をそのまま使用)。**
   ユーザー・Codexなど他者の発言と混同されないようにするための表記であり、省略しない
-  ([Issue #3](https://github.com/imifu/discord_viatual_friend_api/issues/3) 参照)。
+  ([Issue #3](https://github.com/imifu/discord_viatual_friend_api/issues/3) で導入、
+  [Issue #12](https://github.com/imifu/discord_viatual_friend_api/issues/12) によりCodex側の表記
+  (`### FROM：Codex(GPT)`、[AGENTS.md](./AGENTS.md) 8章参照)と揃える形で
+  `## FROM：Claude Code` から `### FROM：Claude` へ統一した)。
 - PR本文には最低限以下を含める。
   - **変更概要**: 何を・なぜ変更したか
   - **設計上の判断**: 既存パターンから外れた選択をした場合はその理由
