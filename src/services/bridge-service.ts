@@ -20,6 +20,13 @@ const FRAME_MS = 20;
 
 const REALTIME_RESTART_INITIAL_DELAY_MS = 1000;
 const REALTIME_RESTART_MAX_DELAY_MS = 30_000;
+// A session that fails immediately after connecting (e.g. insufficient_quota, an invalid model
+// name) still resolves openRealtimeSession() successfully - the WebSocket itself opened fine,
+// even though the very next server message tears it back down. Only treat a reconnect as
+// genuinely healthy (and reset the backoff) once the session has stayed up this long, otherwise
+// a permanent, immediately-recurring error resets the delay every cycle and the retry loop never
+// backs off - it just hammers the API and the Node event loop every ~1s indefinitely.
+const REALTIME_RESTART_SUCCESS_GRACE_MS = 10_000;
 
 // @discordjs/voice's AudioPlayer can stop draining inboundPlaybackStream on its own side
 // (e.g. AutoPaused after a brief voice-connection hiccup that never fully recovers) - the
@@ -29,6 +36,16 @@ const INBOUND_PLAYBACK_STALL_TIMEOUT_MS = 4000;
 const INBOUND_WATCHDOG_INTERVAL_MS = 1000;
 
 const IDLE_CHECK_INTERVAL_MS = 30_000;
+
+// The Realtime API does not pace audio delivery to the reply's actual spoken duration - it sends
+// a whole reply's audio across a handful of large chunks within a second or two of wall-clock
+// time, arriving far faster than real-time. PcmMixer's default ~500ms jitter-buffer cap (tuned
+// for Discord users' roughly real-time-paced Opus packets) can't hold a burst like that, so it
+// continuously evicted older frames to make room for newer ones - audibly corrupting/truncating
+// the model's replies into fast, garbled fragments. Sources carrying the model's own audio
+// (`gptAudioStream`, fed into inboundMixer and clipMixer below) need a buffer generous enough to
+// hold a full reply without dropping anything; 30s covers any realistic single turn.
+const GPT_AUDIO_MAX_BUFFERED_FRAMES = (30 * 1000) / FRAME_MS;
 
 /**
  * Starts the audio relay for a guild in both directions: Discord speakers -> mixed -> resampled
@@ -88,21 +105,77 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     let realtimeGeneration = 0;
     let realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
 
+    // Temporary diagnostic for a reported ~4x playback speedup: tally how many raw (24kHz mono)
+    // and resampled (config.output rate/channels) bytes flow through one response, and compare
+    // the duration those byte counts imply against the wall-clock time between speakingChanged
+    // true/false. This tells us whether the byte count itself is already short (OpenAI-side or
+    // our resample producing too little data) versus the byte count being correct but consumed
+    // too fast downstream (mixer/AudioPlayer pacing).
+    let responseStartedAt = 0;
+    let rawBytesThisResponse = 0;
+    let resampledBytesThisResponse = 0;
+    let deltaCountThisResponse = 0;
+    let minDeltaBytes = Number.POSITIVE_INFINITY;
+    let maxDeltaBytes = 0;
+    let firstDeltaAt = 0;
+    let lastDeltaAt = 0;
+
     function bindRealtimeSession(session: RealtimeSession, generation: number): void {
       session.on('audioDelta', (pcm24kMono) => {
+        const now = Date.now();
+        if (firstDeltaAt === 0) firstDeltaAt = now;
+        lastDeltaAt = now;
+        deltaCountThisResponse += 1;
+        minDeltaBytes = Math.min(minDeltaBytes, pcm24kMono.length);
+        maxDeltaBytes = Math.max(maxDeltaBytes, pcm24kMono.length);
+        rawBytesThisResponse += pcm24kMono.length;
         if (gptAudioStream.destroyed) return;
-        gptAudioStream.write(resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels));
+        const resampled = resampleFromMono(pcm24kMono, REALTIME_SAMPLE_RATE, config.output.sampleRate, config.output.channels);
+        resampledBytesThisResponse += resampled.length;
+        gptAudioStream.write(resampled);
       });
       session.on('speakingChanged', (speaking) => {
         touchActivity();
         updateStatus(guildId, { gptSpeaking: speaking });
         refreshBargeInState();
         logger.info(`GPT発話${speaking ? '開始' : '終了'}: guild=${guildId}`);
+        if (speaking) {
+          responseStartedAt = Date.now();
+          rawBytesThisResponse = 0;
+          resampledBytesThisResponse = 0;
+          deltaCountThisResponse = 0;
+          minDeltaBytes = Number.POSITIVE_INFINITY;
+          maxDeltaBytes = 0;
+          firstDeltaAt = 0;
+          lastDeltaAt = 0;
+        } else if (responseStartedAt > 0) {
+          const wallClockSec = (Date.now() - responseStartedAt) / 1000;
+          const rawImpliedSec = rawBytesThisResponse / (REALTIME_SAMPLE_RATE * 2);
+          const resampledImpliedSec =
+            resampledBytesThisResponse / (config.output.sampleRate * config.output.channels * 2);
+          const deltaSpanSec = firstDeltaAt > 0 ? (lastDeltaAt - firstDeltaAt) / 1000 : 0;
+          const avgDeltaBytes = deltaCountThisResponse > 0 ? Math.round(rawBytesThisResponse / deltaCountThisResponse) : 0;
+          logger.info(
+            `[診断] 音声バイト数と時間の比較: guild=${guildId} wallClock=${wallClockSec.toFixed(2)}s ` +
+              `raw=${rawBytesThisResponse}bytes(${rawImpliedSec.toFixed(2)}s) ` +
+              `resampled=${resampledBytesThisResponse}bytes(${resampledImpliedSec.toFixed(2)}s) ` +
+              `deltaCount=${deltaCountThisResponse} deltaSpan=${deltaSpanSec.toFixed(2)}s ` +
+              `deltaBytes[min=${minDeltaBytes === Number.POSITIVE_INFINITY ? 0 : minDeltaBytes},avg=${avgDeltaBytes},max=${maxDeltaBytes}]`,
+          );
+        }
       });
       session.on('userSpeechStarted', () => {
         touchActivity();
         userSpeaking = true;
         refreshBargeInState();
+        // interrupt_response:true cancels the model's in-flight response server-side as soon as
+        // real user speech is detected, but any audio we'd already buffered from that response
+        // (now up to GPT_AUDIO_MAX_BUFFERED_FRAMES worth, since delivery arrives in bursts far
+        // ahead of real-time - see the comment on that constant) is not discarded on its own.
+        // Without this, the cancelled reply's tail would resume playing at full volume once
+        // bargeInActive is lifted. A no-op if nothing is queued.
+        inboundMixer.clearSource('gpt');
+        clipMixer?.clearSource('gpt');
       });
       session.on('userSpeechStopped', () => {
         userSpeaking = false;
@@ -125,6 +198,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
         model: config.openai.model,
         voice: config.openai.voice,
         instructions: config.airReading.enabled ? config.airReading.prompt : '',
+        speed: config.openai.speed,
       });
       bindRealtimeSession(session, generation);
       return session;
@@ -152,8 +226,13 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
           .then((session) => {
             runtime.realtimeSession = session;
             updateStatus(guildId, { realtimeConnected: true });
-            realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
             logger.info(`Realtimeセッションを再接続しました: guild=${guildId}`);
+            const graceTimer = setTimeout(() => {
+              if (runtime.realtimeSession === session) {
+                realtimeRestartDelayMs = REALTIME_RESTART_INITIAL_DELAY_MS;
+              }
+            }, REALTIME_RESTART_SUCCESS_GRACE_MS);
+            session.once('close', () => clearTimeout(graceTimer));
           })
           .catch((err) => {
             logger.error(`Realtimeセッションの再接続に失敗しました: guild=${guildId}`, err);
@@ -178,7 +257,12 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
       clipRingBuffer = new PcmRingBuffer(config.input.sampleRate, config.input.channels, MAX_CLIP_SECONDS);
       clipDiscordStream = new PassThrough();
       clipMixer = new PcmMixer(
-        { sampleRate: config.input.sampleRate, channels: config.input.channels, frameMs: FRAME_MS },
+        {
+          sampleRate: config.input.sampleRate,
+          channels: config.input.channels,
+          frameMs: FRAME_MS,
+          maxBufferedFrames: GPT_AUDIO_MAX_BUFFERED_FRAMES,
+        },
         (frame) => clipRingBuffer?.push(frame),
       );
       clipMixer.addSource('discord', clipDiscordStream);
@@ -208,7 +292,12 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
     let inboundBackpressured = false;
     let backpressureSince: number | null = null;
     const inboundMixer = new PcmMixer(
-      { sampleRate: config.output.sampleRate, channels: config.output.channels, frameMs: FRAME_MS },
+      {
+        sampleRate: config.output.sampleRate,
+        channels: config.output.channels,
+        frameMs: FRAME_MS,
+        maxBufferedFrames: GPT_AUDIO_MAX_BUFFERED_FRAMES,
+      },
       (frame) => {
         if (inboundPlaybackStream.destroyed || inboundBackpressured) return;
         const playbackFrame = bargeInActive ? applyPcmGain(frame, config.bargeIn.gptPlaybackLevel) : frame;
@@ -341,7 +430,7 @@ export async function startRelay(guildId: string, client: Client): Promise<void>
 
     logger.info(
       `中継開始: guild=${guildId} model=${config.openai.model} voice=${config.openai.voice} ` +
-        `bargeIn=${config.bargeIn.enabled} idleTimeoutMinutes=${config.idleTimeoutMinutes}`,
+        `speed=${config.openai.speed} bargeIn=${config.bargeIn.enabled} idleTimeoutMinutes=${config.idleTimeoutMinutes}`,
     );
   } catch (err) {
     await stopRelay(guildId);

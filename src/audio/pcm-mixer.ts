@@ -2,12 +2,21 @@ import type { Readable } from 'node:stream';
 
 const BYTES_PER_SAMPLE = 2; // s16le
 const DEFAULT_FRAME_MS = 20;
-const MAX_BUFFERED_FRAMES = 25; // ~500ms of jitter buffer per source before we start dropping
+// ~500ms of jitter buffer per source before we start dropping. This default suits sources that
+// arrive at roughly real-time pace (e.g. Discord users' Opus packets). It is far too small for a
+// source that delivers audio in bursts faster than real-time (e.g. the Realtime API, which sends
+// a whole reply's audio across a handful of large chunks within a second or two rather than
+// pacing it out over the reply's actual spoken duration) - such a source needs a much larger cap
+// via `maxBufferedFrames`, or every burst gets truncated down to its last ~500ms as older frames
+// are continuously evicted to make room for newer ones.
+const DEFAULT_MAX_BUFFERED_FRAMES = 25;
 
 export interface PcmMixerOptions {
   sampleRate: number;
   channels: number;
   frameMs?: number;
+  /** Overrides the default ~500ms jitter-buffer cap (in frames) before older data is dropped. */
+  maxBufferedFrames?: number;
 }
 
 /**
@@ -19,6 +28,7 @@ export interface PcmMixerOptions {
 export class PcmMixer {
   private readonly frameBytes: number;
   private readonly frameMs: number;
+  private readonly maxBufferedFrames: number;
   private readonly queues = new Map<string, Buffer[]>();
   private readonly queuedBytes = new Map<string, number>();
   private timer?: NodeJS.Timeout;
@@ -29,6 +39,7 @@ export class PcmMixer {
   ) {
     this.frameMs = options.frameMs ?? DEFAULT_FRAME_MS;
     this.frameBytes = Math.round(options.sampleRate * (this.frameMs / 1000)) * options.channels * BYTES_PER_SAMPLE;
+    this.maxBufferedFrames = options.maxBufferedFrames ?? DEFAULT_MAX_BUFFERED_FRAMES;
   }
 
   addSource(id: string, stream: Readable): void {
@@ -42,7 +53,7 @@ export class PcmMixer {
       const total = (this.queuedBytes.get(id) ?? 0) + chunk.length;
       this.queuedBytes.set(id, total);
 
-      const maxBytes = this.frameBytes * MAX_BUFFERED_FRAMES;
+      const maxBytes = this.frameBytes * this.maxBufferedFrames;
       let overflow = total - maxBytes;
       while (overflow > 0 && queue.length > 1) {
         const dropped = queue.shift();
@@ -51,6 +62,16 @@ export class PcmMixer {
         this.queuedBytes.set(id, (this.queuedBytes.get(id) ?? 0) - dropped.length);
       }
     });
+  }
+
+  /** Discards whatever is currently queued for a source without removing it (it keeps receiving
+   *  new data). Used to drop a cancelled/interrupted response's still-buffered audio instead of
+   *  letting it play out once ducking or muting is lifted. */
+  clearSource(id: string): void {
+    const queue = this.queues.get(id);
+    if (!queue) return;
+    queue.length = 0;
+    this.queuedBytes.set(id, 0);
   }
 
   removeSource(id: string): void {

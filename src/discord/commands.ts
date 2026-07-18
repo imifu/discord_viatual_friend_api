@@ -141,6 +141,19 @@ const handlers: Record<string, Handler> = {
 };
 
 export async function dispatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  // Temporary diagnostic for DiscordAPIError 10062 (Unknown interaction, i.e. we missed
+  // Discord's ~3s ack deadline). Logged unconditionally (not just past a threshold) while this
+  // is under investigation, to get exact numbers instead of a yes/no signal:
+  //   - dispatchLatencyMs: time from Discord creating the interaction to us first seeing it
+  //     (gateway/network delay upstream of us).
+  //   - elapsed (logged in the catch block below): time from us first seeing it to the handler
+  //     throwing, which includes the deferReply() REST round-trip itself (network delay
+  //     downstream, to Discord). A large dispatchLatencyMs with a small elapsed points upstream;
+  //     the reverse points at our own outbound request/network.
+  const dispatchedAt = Date.now();
+  const dispatchLatencyMs = dispatchedAt - interaction.createdTimestamp;
+  logger.info(`インタラクション受信: command=${interaction.commandName} dispatchLatency=${dispatchLatencyMs}ms`);
+
   const handler = handlers[interaction.commandName];
   if (!handler) {
     await interaction.reply({ content: '未実装のコマンドです。', ephemeral: true });
@@ -150,11 +163,12 @@ export async function dispatchCommand(interaction: ChatInputCommandInteraction):
   try {
     await handler(interaction);
   } catch (err) {
+    const elapsedMs = Date.now() - dispatchedAt;
     const message = toUserMessage(err);
     if (err instanceof AppError) {
-      logger.warn(`コマンドエラー [${interaction.commandName}]: ${err.message}`);
+      logger.warn(`コマンドエラー [${interaction.commandName}]: ${err.message} (elapsed=${elapsedMs}ms)`);
     } else {
-      logger.error(`予期しないコマンドエラー [${interaction.commandName}]`, err);
+      logger.error(`予期しないコマンドエラー [${interaction.commandName}] (elapsed=${elapsedMs}ms)`, err);
     }
 
     if (interaction.deferred || interaction.replied) {

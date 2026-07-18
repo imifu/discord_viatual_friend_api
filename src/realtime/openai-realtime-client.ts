@@ -29,6 +29,8 @@ export interface RealtimeSessionOptions {
   model: string;
   voice: string;
   instructions: string;
+  /** Post-processing playback speed multiplier applied by the API itself (0.25-1.5). */
+  speed: number;
 }
 
 function waitForSocketOpen(ws: OpenAIRealtimeWS): Promise<void> {
@@ -77,7 +79,10 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     const client = new OpenAI({ apiKey: options.apiKey });
     let ws: OpenAIRealtimeWS;
     try {
-      ws = await OpenAIRealtimeWS.create(client, { model: options.model });
+      // Disable permessage-deflate: this connection carries frequent audio-bearing messages,
+      // and the synchronous zlib inflate/deflate work per message adds real main-thread load
+      // for a stream that's already binary/base64 audio and gains little from compression.
+      ws = await OpenAIRealtimeWS.create(client, { model: options.model, options: { perMessageDeflate: false } });
       await waitForSocketOpen(ws);
     } catch (err) {
       throw new OpenAIConnectionError(err);
@@ -104,6 +109,7 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
           output: {
             format: { type: 'audio/pcm', rate: REALTIME_SAMPLE_RATE },
             voice: options.voice,
+            speed: options.speed,
           },
         },
       },
