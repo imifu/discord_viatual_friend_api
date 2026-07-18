@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { ScreenCaptureError } from '../utils/errors.js';
+import { ScreenCaptureBusyError, ScreenCaptureError } from '../utils/errors.js';
 
 const DEFAULT_QUALITY = 4;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -12,6 +12,13 @@ export interface CaptureFrameOptions {
   timeoutMs?: number;
 }
 
+// A DirectShow capture device typically only accepts one open handle at a time, so a second
+// ffmpeg process launched while one is already running would just fail with a device-busy error
+// from ffmpeg itself. Reject fast with a clear message instead of spawning a second process that
+// is very likely to fail anyway. Single flag is enough: this app runs as one process, and Step 1
+// only ever has one caller (the /screencap command handler).
+let captureInFlight = false;
+
 /**
  * Grabs a single still frame from a Windows DirectShow video device (e.g. OBS Virtual Camera)
  * via a one-shot ffmpeg subprocess and returns it as JPEG bytes. Pure I/O wrapper with no
@@ -19,6 +26,11 @@ export interface CaptureFrameOptions {
  * being sent to the Realtime API (see Issue #6 Step 2/3).
  */
 export function captureFrame(options: CaptureFrameOptions): Promise<Buffer> {
+  if (captureInFlight) {
+    return Promise.reject(new ScreenCaptureBusyError());
+  }
+  captureInFlight = true;
+
   const quality = options.quality ?? DEFAULT_QUALITY;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
@@ -52,6 +64,7 @@ export function captureFrame(options: CaptureFrameOptions): Promise<Buffer> {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      captureInFlight = false;
       fn();
     };
 

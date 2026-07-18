@@ -2,6 +2,7 @@ import {
   ChatInputCommandInteraction,
   GuildMember,
   MessageFlags,
+  PermissionFlagsBits,
   SlashCommandBuilder,
 } from 'discord.js';
 import { createLogger } from '../utils/logger.js';
@@ -39,7 +40,10 @@ export const commandDefinitions = [
     .setDescription('現在Realtimeセッションに設定されている性格プロンプト(instructions)を表示します'),
   new SlashCommandBuilder()
     .setName('screencap')
-    .setDescription('OBS仮想カメラから1枚キャプチャして画像として返します(検証用。Realtime APIへは送信しません)'),
+    .setDescription('OBS仮想カメラから1枚キャプチャして画像として返します(検証用。Realtime APIへは送信しません)')
+    // Bot動作PCの画面(ゲーム画面以外の通知・別ウィンドウ等を含みうる)を誰でも閲覧できてしまわないよう、
+    // 既定ではサーバー管理権限を持つメンバーのみに制限する(サーバーの「統合」設定から上書き可能)。
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((builder) => builder.toJSON());
 
 type Handler = (interaction: ChatInputCommandInteraction) => Promise<void>;
@@ -126,7 +130,9 @@ async function handleClip(interaction: ChatInputCommandInteraction): Promise<voi
 }
 
 async function handleScreenCap(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply();
+  // 検証用コマンドであり、Bot動作PCの画面内容(ゲーム画面以外を含みうる)を返すため、
+  // 実行したメンバー以外には見えないephemeral応答にする。
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const { video } = loadConfig();
   const jpeg = await captureFrame({ deviceName: video.captureDevice });
   await interaction.editReply({

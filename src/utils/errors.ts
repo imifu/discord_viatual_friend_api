@@ -79,6 +79,12 @@ export class ScreenCaptureError extends AppError {
   }
 }
 
+export class ScreenCaptureBusyError extends AppError {
+  constructor() {
+    super('別の画面キャプチャが進行中です。しばらく待ってから再実行してください。');
+  }
+}
+
 export function toUserMessage(error: unknown): string {
   if (error instanceof AppError) return error.userMessage;
   return '予期しないエラーが発生しました。詳細はログを確認してください。';
