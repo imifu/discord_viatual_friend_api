@@ -94,10 +94,12 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
   private responsePending = false;
   /** Callbacks awaiting a possible `error` event correlated (by event_id) to a client event we sent. */
   private readonly pendingEventErrors = new Map<string, (err: OpenAISessionError) => void>();
-  /** At most one pending "call requestResponse() once the model stops speaking" listener - see requestResponseWhenIdle(). */
+  /** At most one pending "call requestResponse() once no response is busy" listener - see requestResponseWhenIdle()/tryDispatchIdleResponse(). */
   private idleResponseListener?: (speaking: boolean) => void;
-  /** Rejects the shared outcome promise for a pending deferred requestResponseWhenIdle() call, e.g. on close(). */
-  private idleResponseCancel?: (err: OpenAISessionError) => void;
+  /** overrides/resolve/reject for the currently-pending deferred request, so tryDispatchIdleResponse() can fire or cancel it from more than one trigger (see below): a normal speakingChanged(false), or the earlier response that was blocking us failing/timing out before it ever started speaking. */
+  private idleResponseOverrides?: { instructions?: string; maxOutputTokens?: number };
+  private idleResponseResolve?: () => void;
+  private idleResponseReject?: (err: OpenAISessionError) => void;
   /** The shared outcome promise every caller coalesced into the current pending deferred request receives. */
   private idleResponseOutcome?: Promise<void>;
 
@@ -192,17 +194,43 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     });
   }
 
-  /** Shared cleanup for both close() and an unexpected socket disconnect: rejects every pending
-   *  appendImage()/requestResponse() confirmation and any pending deferred idle-response request. */
-  private rejectAllPending(reason: OpenAISessionError): void {
+  /** Clears all deferred-idle-response bookkeeping without settling anything - used once we're
+   *  about to either dispatch or reject it, so a later trigger can't act on stale state. */
+  private clearIdleResponseState(): void {
     if (this.idleResponseListener) {
       this.off('speakingChanged', this.idleResponseListener);
       this.idleResponseListener = undefined;
     }
-    if (this.idleResponseCancel) {
-      this.idleResponseCancel(reason);
-      this.idleResponseCancel = undefined;
-      this.idleResponseOutcome = undefined;
+    this.idleResponseOverrides = undefined;
+    this.idleResponseResolve = undefined;
+    this.idleResponseReject = undefined;
+    this.idleResponseOutcome = undefined;
+  }
+
+  /**
+   * If a deferred requestResponseWhenIdle() call is waiting and no response is currently busy,
+   * dispatch it now. Called from two places: a normal speakingChanged(false) (the response that
+   * was blocking us finished normally), and requestResponse()'s own busy-clearing paths (the
+   * response that was blocking us instead failed or timed out before ever starting - in that
+   * case speakingChanged(false) will never fire for it, so without this second call site a
+   * waiting caller's outcome would never settle - Codexレビューで発覚).
+   */
+  private tryDispatchIdleResponse(): void {
+    if (!this.idleResponseListener || this.responseBusy) return;
+    const overrides = this.idleResponseOverrides;
+    const resolve = this.idleResponseResolve!;
+    const reject = this.idleResponseReject!;
+    this.clearIdleResponseState();
+    this.requestResponse(overrides).then(resolve, reject);
+  }
+
+  /** Shared cleanup for both close() and an unexpected socket disconnect: rejects every pending
+   *  appendImage()/requestResponse() confirmation and any pending deferred idle-response request. */
+  private rejectAllPending(reason: OpenAISessionError): void {
+    if (this.idleResponseReject) {
+      const reject = this.idleResponseReject;
+      this.clearIdleResponseState();
+      reject(reason);
     }
     for (const reject of this.pendingEventErrors.values()) {
       reject(reason);
@@ -281,6 +309,10 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       clearTimeout(busyTimer);
       this.off('speakingChanged', onSpeakingStarted);
       this.responsePending = false;
+      // If this request failed/timed out before ever starting to speak, speakingChanged(false)
+      // will never fire for it - give any deferred waiter a chance to go now instead of waiting
+      // forever for an event that was never coming (Codexレビューで発覚).
+      this.tryDispatchIdleResponse();
     };
     const onSpeakingStarted = (speaking: boolean): void => {
       // Once actually speaking, `speaking` itself is the authority - the flag has done its job
@@ -341,20 +373,22 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
     // call win; later calls while still waiting just join the same pending request and share its
     // outcome promise.
     if (!this.idleResponseListener || !this.idleResponseOutcome) {
+      this.idleResponseOverrides = overrides;
       this.idleResponseOutcome = new Promise<void>((resolve, reject) => {
-        this.idleResponseCancel = reject;
+        this.idleResponseResolve = resolve;
+        this.idleResponseReject = reject;
         // Use on()+manual removal rather than once(): once() would consume itself on the first
         // speakingChanged event regardless of its value, so if that first event happened to fire
         // with `true` (not expected from setSpeaking()'s own transition-only guard today, but
         // this shouldn't depend on that), the deferred request would be silently dropped forever
-        // instead of still waiting for the eventual `false`.
+        // instead of still waiting for the eventual `false`. tryDispatchIdleResponse() is also
+        // called from requestResponse()'s own busy-clearing paths (see there) - not just this
+        // listener - to cover the case where the response we're waiting behind fails/times out
+        // before ever actually starting to speak, since speakingChanged(false) would never fire
+        // for that.
         this.idleResponseListener = (speaking: boolean): void => {
           if (speaking) return;
-          this.off('speakingChanged', this.idleResponseListener!);
-          this.idleResponseListener = undefined;
-          this.idleResponseOutcome = undefined;
-          this.idleResponseCancel = undefined;
-          this.requestResponse(overrides).then(resolve, reject);
+          this.tryDispatchIdleResponse();
         };
         this.on('speakingChanged', this.idleResponseListener);
       });
