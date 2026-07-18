@@ -165,7 +165,7 @@ OpenAI公式の料金ページ([2026年7月時点](https://platform.openai.com/d
 
 ### 画面キャプチャ(検証中、[Issue #6](https://github.com/imifu/discord_viatual_friend_api/issues/6))
 
-`/cap`は、`SCREEN_CAPTURE_DEVICE`(既定 `OBS Virtual Camera`)で指定したWindows DirectShowデバイスからffmpegで1枚だけ静止画をキャプチャし、実行したチャンネルへ画像として投稿するコマンドです。
+`/cap`は、`SCREEN_CAPTURE_DEVICE`(既定 `OBS Virtual Camera`)で指定したWindows DirectShowデバイスからffmpegで1枚だけ静止画をキャプチャし、実行したチャンネルへ画像として投稿するコマンドです。OBSのBase Canvas(既定1920×1080を想定)から960×540へ縮小し、JPEG品質75相当でエンコードします(base64化した際のペイロードサイズとRealtime APIの画像トークン数を抑えるため)。解像度・品質は現時点では固定値で、`src/video/screen-capture.ts`の定数を変更する形になります。
 
 - **中継(`/start`)を実行していない場合**: 画像を投稿するだけで、Realtime APIへは送信されません。OpenAI利用料金には一切影響しません。
 - **`/start`済みの場合**([Issue #19](https://github.com/imifu/discord_viatual_friend_api/issues/19)): 画像をRealtime APIの会話コンテキストへ`input_image`として送信し、続けてAIに応答を促します(`response.create`)。**このときAIが音声で応答するため、通常の音声出力コストが発生します。** 画像自体のコストは`SCREEN_CAPTURE_DETAIL`(既定 `low`、固定約85トークン相当)で低く抑えていますが、`/cap`を実行するたびに1回分の音声応答が発生する点に注意してください。
