@@ -218,7 +218,16 @@ message-postingとtranscript-logには、現時点のREADME手動テスト表に
 
 ## 8. レビュー結果の形式
 
-レビューは原則として次の順で記載します。
+Approve、Request changes、Comment、再レビューなど、PRへ投稿するレビュー関連メッセージの冒頭には、
+投稿者をユーザー・Claudeの発言と混同しないよう、必ず次の見出しを明記します
+(全角コロン、括弧、英字の大文字・小文字を含め、指定表記をそのまま使用する。
+[Issue #12](https://github.com/imifu/discord_viatual_friend_api/issues/12) 参照)。
+
+```markdown
+### FROM：Codex(GPT)
+```
+
+その上で、レビューは原則として次の順で記載します。
 
 1. Findings: P0からP3の順。ファイル・行、発生条件、影響、期待対応を含める。
 2. 確認事項 / 残余リスク: 実機未検証、仕様判断、環境依存事項。
