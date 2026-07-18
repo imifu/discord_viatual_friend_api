@@ -176,19 +176,25 @@ async function handleCap(interaction: ChatInputCommandInteraction): Promise<void
   });
 
   // いずれかの失敗を検知した場合のみフォローアップで訂正する(成功時は音声応答そのものが
-  // 確認になるため、追加のメッセージは送らない)。
+  // 確認になるため、追加のメッセージは送らない)。1つの根本原因につき通知は1件だけにする:
+  // acceptedが失敗した場合、requestResponse()内部でcompletedも連動して同じ理由でrejectされる
+  // ため、両方に個別のcatchを付けると同じ失敗に対して2件のフォローアップが投稿されてしまう
+  // (Codexレビューで発覚)。completedのcatchは、acceptedが成功した場合にだけ登録する。
   void appendOutcome.catch((err: unknown) => {
     logger.warn(`/cap: 画像追加がAPI側で拒否されました: guild=${guildId}`, err);
     void interaction.followUp('さっき送った画像、AIには届かなかったみたい…ごめんね').catch(() => undefined);
   });
-  void accepted.catch((err: unknown) => {
-    logger.warn(`/cap: 応答要求がAPI側で拒否されました: guild=${guildId}`, err);
-    void interaction.followUp('さっき送った画像、反応できなかったみたい…ごめんね').catch(() => undefined);
-  });
-  void completed.catch((err: unknown) => {
-    logger.warn(`/cap: 応答の生成が失敗しました: guild=${guildId}`, err);
-    void interaction.followUp('さっき送った画像への反応が途中で失敗しちゃったみたい…ごめんね').catch(() => undefined);
-  });
+  void accepted.then(
+    () =>
+      completed.catch((err: unknown) => {
+        logger.warn(`/cap: 応答の生成が失敗しました: guild=${guildId}`, err);
+        void interaction.followUp('さっき送った画像への反応が途中で失敗しちゃったみたい…ごめんね').catch(() => undefined);
+      }),
+    (err: unknown) => {
+      logger.warn(`/cap: 応答要求がAPI側で拒否されました: guild=${guildId}`, err);
+      void interaction.followUp('さっき送った画像、反応できなかったみたい…ごめんね').catch(() => undefined);
+    },
+  );
 }
 
 async function handleAirPrompt(interaction: ChatInputCommandInteraction): Promise<void> {

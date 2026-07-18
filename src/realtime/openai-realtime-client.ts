@@ -195,14 +195,18 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       const pending = this.pendingCompletions.get(requestId);
       if (!pending) return;
       this.pendingCompletions.delete(requestId);
-      // `completed`/`incomplete` (e.g. hit our own max_output_tokens cap)/`cancelled` (e.g. the
-      // user's own barge-in interrupted it) all mean *some* real spoken output was very likely
-      // already produced - only `failed` represents a genuine silent failure worth telling the
-      // user about (Codexレビューで指摘: response.createdの受理確認だけでは、その後failed/
-      // incompleteになった場合を見落としていた).
-      if (event.response.status === 'failed') {
+      // `completed`, `cancelled` (e.g. the user's own barge-in interrupted it), and `incomplete`
+      // with reason `max_output_tokens` (our own intentional SCREEN_REACTION_MAX_OUTPUT_TOKENS
+      // cap) all mean *some* real spoken output was very likely already produced. `failed` and
+      // `incomplete` with reason `content_filter` (the safety system cut the response off, quite
+      // possibly before any usable output) are treated as genuine failures worth telling the user
+      // about (Codexレビューで指摘: response.createdの受理確認だけではfailed/incompleteを見落と
+      // していた。さらにincompleteを一律成功扱いすると、content_filterによる打ち切りも見逃す).
+      const status = event.response.status;
+      const isContentFiltered = status === 'incomplete' && event.response.status_details?.reason === 'content_filter';
+      if (status === 'failed' || isContentFiltered) {
         const detail = event.response.status_details?.error;
-        pending.reject(new OpenAISessionError(detail ? `応答が失敗しました: ${JSON.stringify(detail)}` : '応答が失敗しました'));
+        pending.reject(new OpenAISessionError(detail ? `応答が失敗しました: ${JSON.stringify(detail)}` : `応答が失敗しました (status=${status})`));
       } else {
         pending.resolve();
       }
@@ -405,6 +409,12 @@ export class RealtimeSession extends EventEmitter<RealtimeSessionEvents> {
       .catch(() => {});
 
     const completedSettlers = deferred();
+    // Safety net: if a caller only attaches a handler to `completed` conditionally (e.g. skipping
+    // it when `accepted` already failed, to avoid double-reporting the same underlying failure -
+    // see commands.ts's handleCap()), `completed` could otherwise end up with no handler at all
+    // when it rejects, triggering Node's unhandled-rejection crash (the same class of bug found
+    // and fixed earlier for the .finally() derived promise above).
+    void completedSettlers.promise.catch(() => {});
     accepted.then(
       () => this.pendingCompletions.set(requestId, completedSettlers),
       (err: OpenAISessionError) => completedSettlers.reject(err),

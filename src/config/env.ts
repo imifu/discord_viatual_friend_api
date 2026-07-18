@@ -68,9 +68,14 @@ function optionalRangeFloat(name: string, fallback: number, min: number, max: nu
 function optionalRangeInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name];
   if (!raw || raw.trim() === '') return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  if (Number.isNaN(parsed)) {
-    throw new ConfigError(`環境変数 ${name} は数値である必要があります (現在値: "${raw}")。`);
+  // Number.parseInt() silently accepts trailing garbage ("120abc" -> 120) and truncates decimals
+  // ("12.5" -> 12), which would let a typo in .env quietly produce a materially different value
+  // instead of failing fast at startup (Codexレビューで指摘). Number() requires the whole string
+  // to be numeric (rejecting trailing garbage as NaN), and Number.isInteger() rejects decimals;
+  // "1e3"-style exponential notation is still accepted since it does represent a whole number.
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed)) {
+    throw new ConfigError(`環境変数 ${name} は整数である必要があります (現在値: "${raw}")。`);
   }
   if (parsed < min || parsed > max) {
     throw new ConfigError(`環境変数 ${name} は${min}以上${max}以下である必要があります (現在値: "${parsed}")。`);
